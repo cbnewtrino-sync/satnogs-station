@@ -1,0 +1,123 @@
+#!/bin/bash
+# satnogs-post — runs INSIDE the satnogs-client container after each observation.
+#
+# Set in satnogs-setup (Advanced) as — note TLE goes LAST:
+#   SATNOGS_POST_OBSERVATION_SCRIPT=/opt/satnogs-non-free/local/scripts/satnogs-post {{ID}} {{FREQ}} {{TIMESTAMP}} {{BAUD}} {{SCRIPT_NAME}} {{TLE}}
+#   (In the Ansible-based satnogs-setup, wrap the placeholders in {% raw %}...{% endraw %}
+#    or Ansible swallows the whole setting.)
+#   ENABLE_IQ_DUMP=True
+#   IQ_DUMP_FILENAME=/opt/satnogs-non-free/local/iq/current.raw
+#
+# Job: archive the IQ dump as a SigMF recording (<ID>.sigmf-data + <ID>.sigmf-meta)
+# and drop a queue marker. The sample rate is NOT known here — the host-side
+# worker measures it from the signal and fills in core:sample_rate. Keep this
+# fast; always exit 0 so it never disturbs the client.
+
+umask 002   # keep files/dirs group-writable so the host-side worker can manage them
+
+BASE=/opt/satnogs-non-free/local
+IQ_DIR="$BASE/iq"
+QUEUE_DIR="$BASE/queue"
+LOG="$BASE/post.log"
+DUMP="${IQ_DUMP_FILENAME:-$IQ_DIR/current.raw}"
+
+ID="$1"; FREQ="$2"; TIMESTAMP="$3"; BAUD="$4"; SCRIPT_NAME="$5"
+shift 5 2>/dev/null
+TLE="$*"   # TLE is JSON and may contain spaces, so it's taken from all remaining args
+
+log() { echo "$(date -u +%FT%TZ) [${ID:-?}] $*" >> "$LOG"; }
+
+mkdir -p "$IQ_DIR" "$QUEUE_DIR"
+
+if [[ -z "$ID" ]]; then log "no observation ID, skipping"; exit 0; fi
+
+# Newer clients rename the dump to <IQ_DUMP_FILENAME>_<format>_<timestamp>.raw
+# Accept either the plain name or the newest renamed file.
+SRC=""
+if [[ -s "$DUMP" ]]; then
+    SRC="$DUMP"
+else
+    SRC=$(ls -t "${DUMP}"_*.raw 2>/dev/null | head -n 1)
+fi
+if [[ -z "$SRC" || ! -s "$SRC" ]]; then log "no IQ dump matching $DUMP*, skipping"; exit 0; fi
+
+# SigMF datatype from the client's format tag (default: interleaved int16 I/Q)
+case "$(basename "$SRC")" in
+    *_cf32_*) DTYPE=cf32_le ;;
+    *_cs16_*) DTYPE=ci16_le ;;
+    *_cs8_*)  DTYPE=ci8 ;;
+    *)        DTYPE=ci16_le ;;
+esac
+
+DATA="$IQ_DIR/$ID.sigmf-data"
+META="$IQ_DIR/$ID.sigmf-meta"
+if ! mv -f "$SRC" "$DATA"; then log "failed to move $SRC -> $DATA"; exit 0; fi
+SIZE=$(stat -c %s "$DATA")
+
+python3 - "$META" "$ID" "$FREQ" "$TIMESTAMP" "$BAUD" "$SCRIPT_NAME" \
+          "$TLE" "$SIZE" "${SATNOGS_STATION_ID:-}" "$DTYPE" <<'EOF' || log "metadata write failed"
+import json, os, sys
+from datetime import datetime, timezone
+
+out, obs_id, freq, ts, baud, script, tle, size, station, dtype = sys.argv[1:11]
+
+def num(s):
+    try:
+        return int(float(s))
+    except (TypeError, ValueError):
+        return None
+
+try:
+    tle_obj = json.loads(tle)
+except Exception:
+    tle_obj = {}
+if not isinstance(tle_obj, dict):
+    tle_obj = {}
+
+norad = None
+line1 = tle_obj.get("tle1", "")
+if len(line1) >= 7:
+    norad = line1[2:7].strip() or None
+    if norad and norad.isdigit():
+        norad = int(norad)
+
+try:
+    dt = datetime.strptime(ts, "%Y-%m-%dT%H-%M-%S%z").astimezone(timezone.utc)
+    iso = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+except Exception:
+    iso = None
+
+glob = {
+    "core:version": "1.0.0",
+    "core:datatype": dtype,
+    "core:recorder": "satnogs-client IQ dump",
+    "core:description": f"SatNOGS observation {obs_id}",
+    "core:extensions": [{"name": "satnogs", "version": "0.1.0", "optional": True}],
+    "satnogs:observation_id": num(obs_id),
+    "satnogs:station_id": num(station),
+    "satnogs:norad_id": norad,
+    "satnogs:satellite_name": re.sub(r"^0\s+", "", (tle_obj.get("tle0") or "").strip()) or None,
+    "satnogs:baud": num(baud),
+    "satnogs:flowgraph": script or None,
+    "satnogs:tle": tle_obj or None,
+    "satnogs:data_bytes": num(size),
+    "satnogs:sample_rate_status": "unmeasured",   # worker sets core:sample_rate
+    "satnogs:status": "queued",
+}
+capture = {"core:sample_start": 0}
+if num(freq):
+    capture["core:frequency"] = num(freq)
+if iso:
+    capture["core:datetime"] = iso          # scheduled observation start;
+    capture["satnogs:datetime_is_scheduled_start"] = True  # recording starts a few s later
+
+meta = {"global": glob, "captures": [capture], "annotations": []}
+tmp = out + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(meta, f, indent=2)
+os.replace(tmp, out)
+EOF
+
+touch "$QUEUE_DIR/$ID"
+log "archived $(basename "$DATA") (${SIZE} bytes, $DTYPE), queued"
+exit 0
