@@ -96,7 +96,7 @@ glob = {
     "satnogs:observation_id": num(obs_id),
     "satnogs:station_id": num(station),
     "satnogs:norad_id": norad,
-    "satnogs:satellite_name": re.sub(r"^0\s+", "", (tle_obj.get("tle0") or "").strip()) or None,
+    "satnogs:satellite_name": (tle_obj.get("tle0") or "").strip().removeprefix("0 ") or None, 
     "satnogs:baud": num(baud),
     "satnogs:flowgraph": script or None,
     "satnogs:tle": tle_obj or None,
