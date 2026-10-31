@@ -1,0 +1,15 @@
+[Unit]
+Description=SatNOGS IQ worker (bursts, sample rate, decode, telemetry)
+After=docker.service
+
+[Service]
+Type=oneshot
+User=pi
+Group=satnogs-client
+UMask=0002
+ExecStart=/opt/satnogs-worker/venv/bin/python /usr/local/bin/satnogs-worker run
+# stay out of the way of a live observation
+Nice=19
+CPUWeight=10
+IOSchedulingClass=idle
+TimeoutStartSec=3h

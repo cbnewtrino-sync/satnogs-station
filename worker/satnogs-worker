@@ -1,0 +1,751 @@
+#!/usr/bin/env python3
+"""satnogs-worker — host-side processing of archived SatNOGS IQ recordings.
+
+satnogs-post (inside the container) archives each pass as <obs>.sigmf-data +
+<obs>.sigmf-meta and touches queue/<obs>. This worker, run from a systemd
+timer on the host, takes each queued observation and:
+
+  1. finds transmission bursts (cheap, band-limited energy detector)
+  2. measures the true sample rate from the satellite's symbol clock
+     (falls back to the per-(flowgraph, baud) cache for weak passes)
+  3. measures each burst: SNR, Eb/N0, frequency offset, occupied bandwidth
+     -> SigMF annotations
+  4. no bursts -> status "empty", no decode (unless always_decode)
+  5. decodes with gr-satellites (built-in name, NORAD ID, or SatYAML file)
+  6. parses frames into telemetry (satnogs-decoders or own Kaitai parser)
+  7. stores everything in SQLite and writes core:sample_rate, status and
+     annotations back into the .sigmf-meta
+
+Usage:
+  satnogs-worker [options] run [--max N]        process the queue
+  satnogs-worker [options] reprocess OBS_ID...  redo specific observations
+  satnogs-worker [options] status               queue / database summary
+
+Options: --base DIR  --config FILE  --db FILE  -v
+"""
+import argparse
+import fcntl
+import glob
+import hashlib
+import importlib.util
+import json
+import logging
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+import numpy as np
+
+try:
+    import yaml
+except ImportError:          # config is optional; defaults work without it
+    yaml = None
+
+VERSION = "0.1.0"
+DEFAULT_BASE = "/var/lib/docker-bindmounts/satnogs_satnogs-client/opt/satnogs-non-free/local"
+
+DEFAULTS = {
+    "decoder": "auto",          # auto = NORAD ID | gr-satellites name | path/to.yml | none
+    "parser": "none",           # none | satnogs:<Class> | path/to/parser.py[:Class] | path/to.ksy
+    "always_decode": False,     # decode even when no bursts were detected
+    "sample_rate": None,        # force a rate (skip measurement)
+    "retention": {"iq_days": 14, "empty_days": 1, "frames": "forever"},
+}
+SETTINGS = {
+    "gr_satellites": "gr_satellites",
+    "decode_timeout_s": 1800,
+    "pad_seconds": 3.0,             # zeros appended so gr-satellites flushes the last frame
+    "busy_seconds": 120,            # skip run if the client's dump file changed this recently
+    "burst_threshold_db": 3.0,
+    "rate_min_db_cached": 8.0,      # clock-line prominence needed near the cached rate
+    "rate_min_db_wide": 12.0,       # ... needed for a blind (wide) search
+    "max_bursts_for_rate": 40,
+}
+
+log = logging.getLogger("satnogs-worker")
+
+
+# ----------------------------------------------------------------------------
+# IQ access
+# ----------------------------------------------------------------------------
+class IQ:
+    """Random access to a SigMF complex recording as complex64 chunks."""
+    _types = {"ci16_le": (np.int16, 2), "ci16": (np.int16, 2), "ci8": (np.int8, 2),
+              "ci8_le": (np.int8, 2), "cf32_le": (np.float32, 2), "cf32": (np.float32, 2)}
+
+    def __init__(self, path, datatype):
+        if datatype not in self._types:
+            raise ValueError(f"unsupported datatype {datatype}")
+        self.datatype = datatype
+        self.base, self.per = self._types[datatype]
+        self.raw = np.memmap(path, dtype=self.base, mode="r")
+        self.n = len(self.raw) // 2
+        self.scale = 1 / 32768 if self.base == np.int16 else 1 / 128 if self.base == np.int8 else 1.0
+
+    def read(self, a, b):
+        a, b = max(0, int(a)), min(self.n, int(b))
+        if b <= a:
+            return np.zeros(0, np.complex64)
+        v = np.asarray(self.raw[2 * a:2 * b], dtype=np.float32) * np.float32(self.scale)
+        return v.view(np.complex64)
+
+
+# ----------------------------------------------------------------------------
+# Burst detection: in-band energy per block from short FFTs
+# ----------------------------------------------------------------------------
+def band_energy(iq, block, half_frac, chunk_blocks=2048):
+    """Energy within |f| <= half_frac*fs for consecutive blocks of `block` samples."""
+    nfft = 1 << int(np.ceil(np.log2(block)))
+    f = np.fft.fftfreq(nfft)
+    mask = np.abs(f) <= half_frac
+    nb = iq.n // block
+    out = np.empty(nb)
+    for c0 in range(0, nb, chunk_blocks):
+        c1 = min(nb, c0 + chunk_blocks)
+        x = iq.read(c0 * block, c1 * block).reshape(c1 - c0, block)
+        x = x - x.mean()
+        X = np.fft.fft(x, nfft, axis=1)
+        out[c0:c1] = (np.abs(X[:, mask]) ** 2).sum(axis=1)
+    return 10 * np.log10(out + 1e-30)
+
+
+def find_runs(p_db, thresh_db, min_blocks, max_gap):
+    floor = float(np.median(p_db))
+    hot = p_db > floor + thresh_db
+    runs, i, n = [], 0, len(hot)
+    while i < n:
+        if not hot[i]:
+            i += 1
+            continue
+        j = i
+        while True:
+            nxt = j + 1
+            while nxt < n and not hot[nxt] and nxt - j <= max_gap:
+                nxt += 1
+            if nxt < n and hot[nxt] and nxt - j <= max_gap + 1:
+                j = nxt
+            else:
+                break
+        if j - i + 1 >= min_blocks:
+            runs.append((i, j + 1))
+        i = j + 1
+    return runs, floor
+
+
+# ----------------------------------------------------------------------------
+# Sample rate from the symbol clock (generalised symrate.py)
+# ----------------------------------------------------------------------------
+def occupied_fraction(iq, bursts, quiet, block, nfft=256):
+    """Half-width of the bursts' 99% occupied band, in cycles/sample (rate-independent)."""
+    pb = [psd(iq.read(a, b), nfft) for a, b in bursts[:40]]
+    pn = [psd(iq.read(q * block, (q + 1) * block), nfft) for q in quiet[:: max(1, len(quiet) // 100)]]
+    pb, pn = [p for p in pb if p is not None], [p for p in pn if p is not None]
+    if not pb or not pn:
+        return 0.45
+    ex = np.clip(np.mean(pb, axis=0) - np.mean(pn, axis=0), 0, None)
+    f = np.fft.fftshift(np.fft.fftfreq(nfft))
+    if ex.sum() <= 0:
+        return 0.45
+    cum = np.cumsum(ex) / ex.sum()
+    lo, hi = f[np.searchsorted(cum, 0.005)], f[min(np.searchsorted(cum, 0.995), nfft - 1)]
+    return float(np.clip(1.25 * max(abs(lo), abs(hi)), 0.04, 0.45))
+
+
+def clock_spectrum(iq, bursts, max_bursts, half_frac=0.45, N=1 << 20):
+    P = np.zeros(N // 2 + 1)
+    used = 0
+    for a, b in sorted(bursts, key=lambda r: r[0] - r[1])[:max_bursts]:   # longest first
+        seg = iq.read(a, min(b, a + N + 2))
+        if len(seg) < 256:
+            continue
+        if half_frac < 0.45:                     # band-limit: keeps FM demod above threshold
+            X = np.fft.fft(seg)
+            X[np.abs(np.fft.fftfreq(len(seg))) > half_frac] = 0
+            seg = np.fft.ifft(X).astype(np.complex64)
+        d = np.angle(seg[1:] * np.conj(seg[:-1]))
+        d = np.convolve(d, np.ones(3) / 3, mode="same")
+        e = np.diff(d) ** 2
+        e -= e.mean()
+        e *= np.hanning(len(e))
+        S = np.abs(np.fft.rfft(e, N)) ** 2
+        tot = S.sum()
+        if tot > 0:
+            P += S / tot
+            used += 1
+    # whiten with a moving average so sloped noise can't win
+    w = 4001
+    c = np.cumsum(np.concatenate(([0.0], P)))
+    lo = np.clip(np.arange(len(P)) - w // 2, 0, len(P))
+    hi = np.clip(np.arange(len(P)) + w // 2 + 1, 0, len(P))
+    base = (c[hi] - c[lo]) / (hi - lo)
+    return P / (base + 1e-30), used, N
+
+
+def find_line(Pw, N, f_lo, f_hi):
+    idx = np.where((np.fft.rfftfreq(N) > f_lo) & (np.fft.rfftfreq(N) < f_hi))[0]
+    if len(idx) < 5:
+        return None, 0.0
+    k = int(idx[np.argmax(Pw[idx])])
+    if k < 1 or k + 1 >= len(Pw):
+        return None, 0.0
+    y0, y1, y2 = (np.log(Pw[k + i] + 1e-30) for i in (-1, 0, 1))
+    den = y0 - 2 * y1 + y2
+    delta = 0.5 * (y0 - y2) / den if den != 0 else 0.0
+    prom = 10 * np.log10(Pw[k] / np.median(Pw[idx]))
+    return (k + delta) / N, float(prom)
+
+
+def measure_rate(iq, bursts, baud, cached, cfg, half_frac=0.45):
+    """Returns (rate, prominence_db, method) or (None, prom, reason)."""
+    Pw, used, N = clock_spectrum(iq, bursts, cfg["max_bursts_for_rate"], half_frac)
+    if used == 0:
+        return None, 0.0, "no usable bursts"
+    if cached:
+        f0 = baud / cached
+        f, prom = find_line(Pw, N, f0 * 0.98, f0 * 1.02)
+        if f and prom >= cfg["rate_min_db_cached"]:
+            return baud / f, prom, "near-cache"
+    # blind search: 2 .. 64 samples/symbol, and never above the 2.048 MS/s front end
+    f, prom = find_line(Pw, N, max(1 / 64, baud / 2.4e6), 0.45)
+    if f and prom >= cfg["rate_min_db_wide"]:
+        return baud / f, prom, "wide"
+    return None, prom, f"clock line too weak ({prom:.1f} dB)"
+
+
+# ----------------------------------------------------------------------------
+# Per-burst measurements
+# ----------------------------------------------------------------------------
+def psd(x, nfft):
+    n = len(x) // nfft
+    if n == 0:
+        return None
+    seg = x[: n * nfft].reshape(n, nfft) * np.hanning(nfft)
+    return np.fft.fftshift((np.abs(np.fft.fft(seg, axis=1)) ** 2).mean(axis=0))
+
+
+def measure_bursts(iq, bursts, quiet_blocks, block, rate, baud, half_hz):
+    nfft = int(2 ** np.clip(np.round(np.log2(rate / 200)), 6, 12))   # ~200 Hz bins
+    f = np.fft.fftshift(np.fft.fftfreq(nfft, 1 / rate))
+    band = np.abs(f) <= half_hz
+    # noise PSD from quiet blocks spread across the pass
+    pick = quiet_blocks[np.linspace(0, len(quiet_blocks) - 1, min(200, len(quiet_blocks))).astype(int)] \
+        if len(quiet_blocks) else []
+    noise = [psd(iq.read(b * block, b * block + max(block, nfft)), nfft) for b in pick]
+    noise = [p for p in noise if p is not None]
+    if not noise:
+        return [{} for _ in bursts]
+    Pn = np.mean(noise, axis=0)
+    out = []
+    for a, b in bursts:
+        Pb = psd(iq.read(a, b), nfft)
+        if Pb is None:
+            out.append({})
+            continue
+        ex = np.clip(Pb - Pn, 0, None) * band
+        tot = ex.sum()
+        if tot <= 0:
+            out.append({})
+            continue
+        cum = np.cumsum(ex) / tot
+        lo = f[np.searchsorted(cum, 0.005)]
+        hi = f[min(np.searchsorted(cum, 0.995), nfft - 1)]
+        occ = (f >= lo) & (f <= hi)
+        s, n = ex[occ].sum(), Pn[occ].sum()
+        bw = max(hi - lo, rate / nfft)
+        snr = 10 * np.log10(s / n) if n > 0 and s > 0 else None
+        out.append({
+            "offset_hz": float((f * ex).sum() / tot),
+            "lo_hz": float(lo), "hi_hz": float(hi),
+            "snr_db": snr,
+            "ebn0_db": snr + 10 * np.log10(bw / baud) if snr is not None and baud else None,
+        })
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Decoding
+# ----------------------------------------------------------------------------
+def kiss_frames(buf):
+    frames = []
+    for chunk in buf.split(b"\xc0"):
+        if not chunk:
+            continue
+        data, esc = bytearray(), False
+        for c in chunk:
+            if esc:
+                data.append({0xDC: 0xC0, 0xDD: 0xDB}.get(c, c))
+                esc = False
+            elif c == 0xDB:
+                esc = True
+            else:
+                data.append(c)
+        if data and data[0] == 0x00:            # 0x09 = gr-satellites timestamp frame
+            frames.append(bytes(data[1:]))
+    return frames
+
+
+def write_padded(iq, src, dst, pad_samples):
+    """Copy for gr-satellites: int16/complex64 input plus trailing zeros."""
+    with open(dst, "wb") as out:
+        if iq.base == np.int8:                  # gr-satellites has no int8 input
+            for a in range(0, iq.n, 1 << 22):
+                out.write((np.asarray(iq.raw[2 * a:2 * min(iq.n, a + (1 << 22))], np.int16) * 256).tobytes())
+        else:
+            with open(src, "rb") as f:
+                shutil.copyfileobj(f, out, 1 << 22)
+        zero = np.zeros(2 * min(pad_samples, 1 << 20), np.int16 if iq.base != np.float32 else np.float32)
+        left = pad_samples
+        while left > 0:
+            k = min(left, len(zero) // 2)
+            out.write(zero[: 2 * k].tobytes())
+            left -= k
+    return "--rawfile" if iq.base == np.float32 else "--rawint16"
+
+
+HEXLINE = re.compile(r"^[0-9a-f]{4}: |^\*+|^pdu[ _]|^contents")
+
+
+def run_decoder(sat_arg, iq, data_path, rate, work, cfg):
+    os.makedirs(work, exist_ok=True)
+    tag = f"{os.getpid()}"
+    padded, kiss = os.path.join(work, f"in-{tag}.raw"), os.path.join(work, f"out-{tag}.kiss")
+    try:
+        flag = write_padded(iq, data_path, padded, int(cfg["pad_seconds"] * rate))
+        cmd = [cfg["gr_satellites"], str(sat_arg), flag, padded, "--samp_rate", f"{rate:.3f}",
+               "--iq", "--kiss_out", kiss, "--hexdump"]
+        log.debug("decode: %s", " ".join(cmd))
+        t0 = time.time()
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=cfg["decode_timeout_s"], text=True, errors="replace")
+        # hexdump output is noise; keep only non-hexdump lines for error reports
+        err = "\n".join(l for l in (p.stdout or "").splitlines()
+                        if l.strip() and not HEXLINE.match(l)).strip()
+        if "not found" in err and "atellite" in err:
+            return None, f"gr-satellites does not know {sat_arg}"
+        if p.returncode != 0:
+            return None, f"gr-satellites exit {p.returncode}: {err[-400:]}"
+        frames = kiss_frames(open(kiss, "rb").read()) if os.path.exists(kiss) else []
+        log.info("  decoded %d frames in %.0f s", len(frames), time.time() - t0)
+        return frames, None
+    except subprocess.TimeoutExpired:
+        return None, "gr-satellites timed out"
+    finally:
+        for p_ in (padded, kiss):
+            if os.path.exists(p_):
+                os.unlink(p_)
+
+
+# ----------------------------------------------------------------------------
+# Telemetry parsers
+# ----------------------------------------------------------------------------
+def kaitai_dict(obj, depth=0):
+    if depth > 12:
+        return None
+    if isinstance(obj, (bytes, bytearray)):
+        return obj.hex()
+    if isinstance(obj, (int, float, str, bool)) or obj is None:
+        return obj
+    if isinstance(obj, list):
+        return [kaitai_dict(v, depth + 1) for v in obj]
+    if hasattr(obj, "name") and hasattr(obj, "value") and type(obj).__module__ != "builtins":
+        return obj.name                          # Enum
+    if hasattr(obj, "_io"):
+        out = {}
+        for k in dir(obj):
+            if k.startswith("_") or k in ("close", "from_file", "from_bytes", "from_io"):
+                continue
+            try:
+                v = getattr(obj, k)
+            except Exception:
+                continue
+            if callable(v) and not hasattr(v, "_io"):
+                continue
+            out[k] = kaitai_dict(v, depth + 1)
+        return out
+    return str(obj)
+
+
+def jsonable(d):
+    return json.loads(json.dumps(d, default=lambda o: o.hex() if isinstance(o, (bytes, bytearray))
+                                 else getattr(o, "name", str(o))))
+
+
+def load_parser(spec, cfgdir, cache_dir):
+    """Returns (name, fn(bytes)->dict) or (None, None)."""
+    if not spec or spec == "none":
+        return None, None
+    if spec.startswith("satnogs:"):
+        from satnogsdecoders import decoder as sd
+        cls = getattr(sd, spec.split(":", 1)[1])
+
+        def parse(b):
+            s = cls.from_bytes(b)
+            return sd.get_fields(s) or kaitai_dict(s)
+        return spec, parse
+    path, _, clsname = spec.partition(":")
+    path = path if os.path.isabs(path) else os.path.join(cfgdir, path)
+    if path.endswith(".ksy"):
+        out = os.path.join(cache_dir, "ksy")
+        os.makedirs(out, exist_ok=True)
+        mod = os.path.join(out, os.path.basename(path)[:-4] + ".py")
+        if not os.path.exists(mod) or os.path.getmtime(mod) < os.path.getmtime(path):
+            subprocess.run(["kaitai-struct-compiler", "-t", "python", "--outdir", out, path],
+                           check=True, capture_output=True)
+        path = mod
+    spec_ = importlib.util.spec_from_file_location(f"parser_{abs(hash(path))}", path)
+    m = importlib.util.module_from_spec(spec_)
+    spec_.loader.exec_module(m)
+    if clsname:
+        cls = getattr(m, clsname)
+    else:
+        from kaitaistruct import KaitaiStruct
+        cls = next(v for v in vars(m).values()
+                   if isinstance(v, type) and issubclass(v, KaitaiStruct) and v is not KaitaiStruct
+                   and v.__module__ == m.__name__)
+    return spec, lambda b: kaitai_dict(cls.from_bytes(b))
+
+
+# ----------------------------------------------------------------------------
+# Database
+# ----------------------------------------------------------------------------
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS observations (
+  obs_id INTEGER PRIMARY KEY, norad_id INTEGER, satellite TEXT, start_utc TEXT,
+  freq_hz INTEGER, baud INTEGER, flowgraph TEXT, n_samples INTEGER,
+  sample_rate REAL, rate_status TEXT, clock_line_db REAL, duration_s REAL,
+  n_bursts INTEGER, best_snr_db REAL, decoder TEXT, n_frames INTEGER,
+  status TEXT, error TEXT, processed_utc TEXT, worker_version TEXT, data_path TEXT);
+CREATE TABLE IF NOT EXISTS bursts (
+  obs_id INTEGER, idx INTEGER, sample_start INTEGER, sample_count INTEGER,
+  t_offset_s REAL, duration_s REAL, snr_db REAL, ebn0_db REAL, offset_hz REAL,
+  lo_hz REAL, hi_hz REAL, PRIMARY KEY (obs_id, idx));
+CREATE TABLE IF NOT EXISTS frames (
+  frame_id INTEGER PRIMARY KEY, obs_id INTEGER, norad_id INTEGER, start_utc TEXT,
+  idx INTEGER, length INTEGER, data BLOB, sha1 TEXT, UNIQUE (obs_id, sha1));
+CREATE TABLE IF NOT EXISTS telemetry (
+  frame_id INTEGER PRIMARY KEY, parser TEXT, fields TEXT, error TEXT);
+CREATE TABLE IF NOT EXISTS rate_cache (
+  flowgraph TEXT, baud INTEGER, sample_rate REAL, n INTEGER, updated_utc TEXT,
+  PRIMARY KEY (flowgraph, baud));
+CREATE INDEX IF NOT EXISTS frames_norad ON frames (norad_id, start_utc);
+"""
+
+
+def db_open(path):
+    db = sqlite3.connect(path, timeout=30)
+    db.executescript(SCHEMA)
+    return db
+
+
+def now_utc():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ----------------------------------------------------------------------------
+# One observation
+# ----------------------------------------------------------------------------
+class Ctx:
+    def __init__(self, base, config_path, db_path):
+        self.base = base
+        self.iq_dir = os.path.join(base, "iq")
+        self.queue_dir = os.path.join(base, "queue")
+        self.work = os.path.join(base, "work")
+        self.cache = os.path.join(base, "cache")
+        self.config_path = config_path
+        self.cfgdir = os.path.dirname(os.path.abspath(config_path))
+        conf = {}
+        if os.path.exists(config_path):
+            if yaml is None:
+                raise SystemExit("python3-yaml is needed to read " + config_path)
+            conf = yaml.safe_load(open(config_path)) or {}
+        self.settings = {**SETTINGS, **(conf.get("settings") or {})}
+        self.defaults = {**DEFAULTS, **(conf.get("defaults") or {})}
+        self.sats = {int(k): (v or {}) for k, v in (conf.get("satellites") or {}).items()}
+        self.db = db_open(db_path)
+        self._parsers = {}
+
+    def satcfg(self, norad):
+        c = dict(self.defaults)
+        c.update(self.sats.get(norad, {}))
+        return c
+
+    def parser(self, spec):
+        if spec not in self._parsers:
+            try:
+                self._parsers[spec] = load_parser(spec, self.cfgdir, self.cache)
+            except Exception as e:
+                log.error("parser %s unavailable: %s", spec, e)
+                self._parsers[spec] = (spec, None)
+        return self._parsers[spec]
+
+
+def process(ctx, obs_id):
+    meta_path = os.path.join(ctx.iq_dir, f"{obs_id}.sigmf-meta")
+    data_path = os.path.join(ctx.iq_dir, f"{obs_id}.sigmf-data")
+    meta = json.load(open(meta_path))
+    g = meta["global"]
+    cap = meta["captures"][0]
+    norad, baud = g.get("satnogs:norad_id"), g.get("satnogs:baud") or 0
+    flow = g.get("satnogs:flowgraph") or "?"
+    freq = cap.get("core:frequency")
+    sc = ctx.satcfg(norad)
+    S = ctx.settings
+    iq = IQ(data_path, g.get("core:datatype", "ci16_le"))
+    log.info("obs %s: %s (NORAD %s), %d baud, %s, %.0f MB",
+             obs_id, g.get("satnogs:satellite_name"), norad, baud, flow, os.path.getsize(data_path) / 1e6)
+
+    # --- pass 1: rate-independent detection (block = 1024 samples, centre half of band)
+    p1 = band_energy(iq, 1024, 0.25)
+    runs1, floor1 = find_runs(p1, S["burst_threshold_db"], 3, 2)
+    coarse = [(a * 1024, b * 1024) for a, b in runs1]
+    hot1 = np.zeros(len(p1), bool)
+    for a, b in runs1:
+        hot1[max(0, a - 3):b + 3] = True
+    quiet1 = np.where(~hot1 & (p1 < floor1 + 1.0))[0]
+
+    # --- sample rate
+    row = ctx.db.execute("SELECT sample_rate FROM rate_cache WHERE flowgraph=? AND baud=?",
+                         (flow, baud)).fetchone()
+    cached = row[0] if row else None
+    rate, prom, rate_status = None, None, "unmeasured"
+    if sc.get("sample_rate"):
+        rate, rate_status = float(sc["sample_rate"]), "configured"
+    elif baud and coarse:
+        occ = occupied_fraction(iq, coarse, quiet1, 1024)
+        rate, prom, how = measure_rate(iq, coarse, baud, cached, S, occ)
+        if rate:
+            rate_status = "measured"
+            log.info("  rate %.1f S/s (%.3f samples/symbol, clock line %.1f dB, %s, band +-%.3f fs)",
+                     rate, rate / baud, prom, how, occ)
+        else:
+            log.info("  rate not measured: %s", how)
+    if rate is None and cached:
+        rate, rate_status = cached, "cached"
+        log.info("  using cached rate %.1f S/s", rate)
+
+    # --- pass 2: band-limited detection at the true rate (10 ms blocks)
+    bursts, meas, block = coarse, [{} for _ in coarse], 1024
+    if rate:
+        block = max(64, int(round(rate * 0.010)))
+        half_hz = min(0.8 * baud + 1000, 0.45 * rate) if baud else 0.25 * rate
+        p2 = band_energy(iq, block, half_hz / rate)
+        runs2, floor = find_runs(p2, S["burst_threshold_db"], 4, 2)
+        bursts = [(a * block, b * block) for a, b in runs2]
+        hot = np.zeros(len(p2), bool)
+        for a, b in runs2:
+            hot[max(0, a - 5):b + 5] = True
+        quiet = np.where(~hot & (p2 < floor + 1.0))[0]
+        meas = measure_bursts(iq, bursts, quiet, block, rate, baud, half_hz)
+    log.info("  %d bursts", len(bursts))
+
+    # --- decode
+    decoder = str(sc.get("decoder", "auto"))
+    sat_arg = None
+    if decoder == "auto":
+        sat_arg = norad
+    elif decoder != "none":
+        sat_arg = decoder if not decoder.endswith((".yml", ".yaml")) or os.path.isabs(decoder) \
+            else os.path.join(ctx.cfgdir, decoder)
+    frames, error, status = [], None, None
+    if not bursts and not sc.get("always_decode"):
+        status = "empty"
+    elif sat_arg is None:
+        status = "no_decoder"
+    elif not rate:
+        status, error = "failed", "sample rate unknown"
+    else:
+        frames, error = run_decoder(sat_arg, iq, data_path, rate, ctx.work, S)
+        status = "decoded" if frames else ("no_frames" if frames is not None else
+                                            "no_decoder" if "does not know" in (error or "") else "failed")
+        frames = frames or []
+
+    # unique frames, original order
+    seen, uniq = set(), []
+    for fr in frames:
+        h = hashlib.sha1(fr).hexdigest()
+        if h not in seen:
+            seen.add(h)
+            uniq.append((fr, h))
+
+    pname, pfn = ctx.parser(sc.get("parser", "none"))
+    start = cap.get("core:datetime")
+    dur = iq.n / rate if rate else None
+    snrs = [m["snr_db"] for m in meas if m.get("snr_db") is not None]
+
+    # --- database (one transaction)
+    db = ctx.db
+    with db:
+        old = [r[0] for r in db.execute("SELECT frame_id FROM frames WHERE obs_id=?", (obs_id,))]
+        db.executemany("DELETE FROM telemetry WHERE frame_id=?", [(i,) for i in old])
+        db.execute("DELETE FROM frames WHERE obs_id=?", (obs_id,))
+        db.execute("DELETE FROM bursts WHERE obs_id=?", (obs_id,))
+        db.execute("INSERT OR REPLACE INTO observations VALUES "
+                   "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (obs_id, norad, g.get("satnogs:satellite_name"), start, freq, baud, flow,
+                    iq.n, rate, rate_status, prom, dur, len(bursts), max(snrs) if snrs else None,
+                    str(sat_arg) if sat_arg is not None else decoder, len(uniq), status, error,
+                    now_utc(), VERSION, data_path))
+        for i, ((a, b), m) in enumerate(zip(bursts, meas)):
+            db.execute("INSERT INTO bursts VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                       (obs_id, i, a, b - a, a / rate if rate else None, (b - a) / rate if rate else None,
+                        m.get("snr_db"), m.get("ebn0_db"), m.get("offset_hz"), m.get("lo_hz"), m.get("hi_hz")))
+        for i, (fr, h) in enumerate(uniq):
+            cur = db.execute("INSERT INTO frames (obs_id, norad_id, start_utc, idx, length, data, sha1) "
+                             "VALUES (?,?,?,?,?,?,?)", (obs_id, norad, start, i, len(fr), fr, h))
+            if pfn:
+                try:
+                    fields, perr = json.dumps(jsonable(pfn(fr))), None
+                except Exception as e:
+                    fields, perr = None, f"{type(e).__name__}: {e}"[:300]
+                db.execute("INSERT INTO telemetry VALUES (?,?,?,?)", (cur.lastrowid, pname, fields, perr))
+        if rate_status == "measured" and baud:
+            db.execute("INSERT INTO rate_cache VALUES (?,?,?,1,?) ON CONFLICT(flowgraph, baud) DO UPDATE "
+                       "SET sample_rate=excluded.sample_rate, n=n+1, updated_utc=excluded.updated_utc",
+                       (flow, baud, rate, now_utc()))
+
+    # --- SigMF meta
+    if rate:
+        g["core:sample_rate"] = rate
+        g["satnogs:samples_per_symbol"] = round(rate / baud, 4) if baud else None
+    else:
+        g.pop("core:sample_rate", None)
+    g["satnogs:sample_rate_status"] = rate_status
+    if prom is not None:
+        g["satnogs:clock_line_db"] = round(prom, 1)
+    g.update({"satnogs:status": status, "satnogs:bursts": len(bursts), "satnogs:frames": len(uniq),
+              "satnogs:decoder": str(sat_arg) if sat_arg is not None else decoder,
+              "satnogs:processed": now_utc(), "satnogs:worker_version": VERSION})
+    if error:
+        g["satnogs:error"] = error
+    else:
+        g.pop("satnogs:error", None)
+    anns = [a for a in meta.get("annotations", []) if a.get("core:label") != "burst"]
+    for (a, b), m in zip(bursts, meas):
+        ann = {"core:sample_start": int(a), "core:sample_count": int(b - a), "core:label": "burst",
+               "core:generator": f"satnogs-worker {VERSION}"}
+        if m and freq:
+            ann["core:freq_lower_edge"] = round(freq + m["lo_hz"], 1)
+            ann["core:freq_upper_edge"] = round(freq + m["hi_hz"], 1)
+        if m:
+            ann["satnogs:offset_hz"] = round(m["offset_hz"], 1)
+            if m.get("snr_db") is not None:
+                ann["satnogs:snr_db"] = round(m["snr_db"], 2)
+                ann["satnogs:ebn0_db"] = round(m["ebn0_db"], 2)
+        anns.append(ann)
+    meta["annotations"] = sorted(anns, key=lambda a: a["core:sample_start"])
+    tmp = meta_path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(meta, f, indent=2)
+    os.replace(tmp, meta_path)
+    log.info("  -> %s, %d frames%s", status, len(uniq), f" ({error})" if error else "")
+    return status
+
+
+# ----------------------------------------------------------------------------
+# Commands
+# ----------------------------------------------------------------------------
+def client_busy(ctx):
+    lim = ctx.settings["busy_seconds"]
+    for p in glob.glob(os.path.join(ctx.iq_dir, "current.raw*")):
+        try:
+            if time.time() - os.path.getmtime(p) < lim:
+                return p
+        except OSError:
+            pass
+    return None
+
+
+def cmd_run(ctx, args, ids=None):
+    lock = open(os.path.join(ctx.base, ".worker.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log.info("another worker is running")
+        return 0
+    queued = ids is None
+    if queued:
+        ids = sorted((int(n) for n in os.listdir(ctx.queue_dir) if n.isdigit()), key=int)[: args.max]
+    rc = 0
+    for obs in ids:
+        busy = client_busy(ctx)
+        if busy:
+            log.info("observation in progress (%s), deferring", os.path.basename(busy))
+            break
+        try:
+            process(ctx, obs)
+        except FileNotFoundError as e:
+            log.error("obs %s: %s", obs, e)
+            rc = 1
+        except Exception:
+            log.exception("obs %s failed", obs)
+            rc = 1
+            with ctx.db:
+                ctx.db.execute("INSERT INTO observations (obs_id, status, error, processed_utc, worker_version) "
+                               "VALUES (?, 'failed', ?, ?, ?) ON CONFLICT(obs_id) DO UPDATE SET "
+                               "status='failed', error=excluded.error, processed_utc=excluded.processed_utc",
+                               (obs, f"{sys.exc_info()[0].__name__}: {sys.exc_info()[1]}"[:400], now_utc(), VERSION))
+        # finished either way: don't retry forever (use `reprocess` after a fix)
+        q = os.path.join(ctx.queue_dir, str(obs))
+        if os.path.exists(q):
+            os.unlink(q)
+    return rc
+
+
+def cmd_status(ctx, _args):
+    q = sorted(n for n in os.listdir(ctx.queue_dir) if n.isdigit()) if os.path.isdir(ctx.queue_dir) else []
+    print(f"queued: {len(q)} {' '.join(q[:10])}")
+    for r in ctx.db.execute("SELECT status, COUNT(*) FROM observations GROUP BY status"):
+        print(f"  {r[0]:<11} {r[1]}")
+    print("recent:")
+    for r in ctx.db.execute("SELECT obs_id, satellite, start_utc, n_bursts, n_frames, sample_rate, "
+                            "rate_status, best_snr_db, status FROM observations "
+                            "ORDER BY processed_utc DESC LIMIT 10"):
+        snr = f"{r[7]:5.1f}" if r[7] is not None else "  -  "
+        rate = f"{r[5]:9.1f}" if r[5] else "        -"
+        print(f"  {r[0]:>9} {str(r[1])[:16]:<16} {r[2] or '':<20} bursts {r[3] or 0:>3} frames {r[4] or 0:>3} "
+              f"rate {rate} {r[6] or '':<10} snr {snr} {r[8]}")
+    print("rate cache:")
+    for r in ctx.db.execute("SELECT flowgraph, baud, sample_rate, n FROM rate_cache"):
+        print(f"  {r[0]} @ {r[1]} baud: {r[2]:.1f} S/s ({r[3]} passes)")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--base", default=os.environ.get("SATNOGS_LOCAL", DEFAULT_BASE))
+    ap.add_argument("--config")
+    ap.add_argument("--db")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    sub = ap.add_subparsers(dest="cmd")
+    r = sub.add_parser("run")
+    r.add_argument("--max", type=int, default=50)
+    rp = sub.add_parser("reprocess")
+    rp.add_argument("ids", nargs="+", type=int)
+    sub.add_parser("status")
+    args = ap.parse_args()
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(levelname)s %(message)s" if os.environ.get("INVOCATION_ID")
+                        else "%(asctime)s %(levelname)s %(message)s")
+    if not os.access(args.base, os.R_OK | os.W_OK | os.X_OK):
+        raise SystemExit(f"cannot access {args.base} (run as a member of group satnogs-client?)")
+    ctx = Ctx(args.base, args.config or os.path.join(args.base, "worker.yml"),
+              args.db or os.path.join(args.base, "station.db"))
+    for d in (ctx.queue_dir, ctx.work, ctx.cache):
+        os.makedirs(d, exist_ok=True)
+    if args.cmd == "status":
+        return cmd_status(ctx, args)
+    if args.cmd == "reprocess":
+        args.max = len(args.ids)
+        return cmd_run(ctx, args, ids=args.ids)
+    if args.cmd is None:
+        args.max = 50
+    return cmd_run(ctx, args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

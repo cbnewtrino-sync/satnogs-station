@@ -1,0 +1,29 @@
+# satnogs-worker configuration — installed to <local>/worker.yml by install.sh.
+# Relative paths (SatYAML, parsers) are relative to this file's directory.
+#
+# decoder: auto            gr-satellites by NORAD ID
+#          <NAME>          gr-satellites built-in satellite name
+#          satyaml/X.yml   custom SatYAML file
+#          none            archive + burst annotations only
+# parser:  none
+#          satnogs:<Class> satnogs-decoders class (e.g. satnogs:Spirone)
+#          ksy/X.ksy       own Kaitai struct (needs kaitai-struct-compiler)
+#          ksy/X.py[:Cls]  pre-compiled Kaitai Python module
+
+defaults:
+  decoder: auto
+  parser: none
+  always_decode: false
+  retention: { iq_days: 14, empty_days: 1, frames: forever }   # applied by the retention job (not yet built)
+
+satellites:
+  98492: { decoder: satyaml/SPIRONE.yml, parser: "satnogs:Spirone" }
+
+settings:
+  gr_satellites: gr_satellites
+  decode_timeout_s: 1800
+  pad_seconds: 3.0
+  busy_seconds: 120          # defer while the client is writing an IQ dump
+  burst_threshold_db: 3.0
+  rate_min_db_cached: 8.0
+  rate_min_db_wide: 12.0

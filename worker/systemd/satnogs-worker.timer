@@ -1,0 +1,9 @@
+[Unit]
+Description=Run satnogs-worker every 5 minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitInactiveSec=5min
+
+[Install]
+WantedBy=timers.target

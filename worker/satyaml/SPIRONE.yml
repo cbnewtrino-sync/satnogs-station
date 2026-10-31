@@ -1,0 +1,15 @@
+# SPIRONE — for gr-satellites versions without a built-in SPIRONE entry.
+# Values from station notes: 436.650 MHz, 9k6 GMSK, AX.25 G3RUH.
+name: SPIRONE
+norad: 98492
+data:
+  &tlm Telemetry:
+    telemetry: ax25
+transmitters:
+  9k6 GMSK downlink:
+    frequency: 436.650e+6
+    modulation: FSK
+    baudrate: 9600
+    framing: AX.25 G3RUH
+    data:
+    - *tlm
