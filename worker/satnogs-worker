@@ -6,8 +6,8 @@ satnogs-post (inside the container) archives each pass as <obs>.sigmf-data +
 timer on the host, takes each queued observation and:
 
   1. finds transmission bursts (cheap, band-limited energy detector)
-  2. measures the true sample rate from the satellite's symbol clock
-     (falls back to the per-(flowgraph, baud) cache for weak passes)
+  2. sets the sample rate from the flowgraph rule (exact) and measures the
+     satellite's true baud from its symbol clock (history fallback when weak)
   3. measures each burst: SNR, Eb/N0, frequency offset, occupied bandwidth
      -> SigMF annotations
   4. no bursts -> status "empty", no decode (unless always_decode)
@@ -46,7 +46,7 @@ try:
 except ImportError:          # config is optional; defaults work without it
     yaml = None
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DEFAULT_BASE = "/var/lib/docker-bindmounts/satnogs_satnogs-client/opt/satnogs-non-free/local"
 
 DEFAULTS = {
@@ -62,8 +62,10 @@ SETTINGS = {
     "pad_seconds": 3.0,             # zeros appended so gr-satellites flushes the last frame
     "busy_seconds": 120,            # skip run if the client's dump file changed this recently
     "burst_threshold_db": 3.0,
-    "rate_min_db_cached": 8.0,      # clock-line prominence needed near the cached rate
-    "rate_min_db_wide": 12.0,       # ... needed for a blind (wide) search
+    "clock_min_db": 8.0,            # clock-line prominence needed near the nominal baud
+    "clock_min_db_blind": 12.0,     # ... for a blind search (unknown flowgraph only)
+    "baud_search_frac": 0.02,       # search satellite baud within +-2 % of nominal
+    "baud_flag_ppm": 1000,          # warn when a satellite's baud is further off than this
     "max_bursts_for_rate": 40,
 }
 
@@ -200,21 +202,56 @@ def find_line(Pw, N, f_lo, f_hi):
     return (k + delta) / N, float(prom)
 
 
-def measure_rate(iq, bursts, baud, cached, cfg, half_frac=0.45):
-    """Returns (rate, prominence_db, method) or (None, prom, reason)."""
+def nominal_rate(flowgraph, baud):
+    """IQ dump sample rate chosen by the SatNOGS flowgraphs, or None if unknown.
+
+    Mirrors satnogs-flowgraphs' decimation rule as reimplemented in
+    kng/satnogs-client-docker addons/scripts/find_samp_rate.py:
+    audio rate 48 kHz, sps 4. Confirmed on station 5263 for satnogs_fsk.py
+    @ 9600 (57,600). The per-pass clock measurement checks it every time.
+    """
+    def dec(mult):
+        d = 2
+        while d * baud < 48000:
+            d += 1
+        if d % mult:
+            d += mult - d % mult
+        return d
+
+    fg = flowgraph or ""
+    if not fg.startswith("satnogs_"):
+        return None
+    if "_sstv" in fg or "_apt" in fg:
+        return 4 * 4160 * 4
+    if any(k in fg for k in ("_bpsk", "_ssb", "_fsk", "_qubik")):
+        if not baud or baud < 1:
+            return None
+        if "_bpsk" in fg or "_ssb" in fg:
+            return float(dec(4) * baud)
+        return float(max(4, dec(2)) * baud)
+    return 48000.0                      # cw, fm, afsk, ...: fixed audio-rate dump
+
+
+def measure_clock(iq, bursts, f0, frac, min_db, cfg, half_frac):
+    """Symbol-clock line near f0 (cycles/sample, +-frac). Returns (f, prom_db, reason)."""
     Pw, used, N = clock_spectrum(iq, bursts, cfg["max_bursts_for_rate"], half_frac)
     if used == 0:
-        return None, 0.0, "no usable bursts"
-    if cached:
-        f0 = baud / cached
-        f, prom = find_line(Pw, N, f0 * 0.98, f0 * 1.02)
-        if f and prom >= cfg["rate_min_db_cached"]:
-            return baud / f, prom, "near-cache"
-    # blind search: 2 .. 64 samples/symbol, and never above the 2.048 MS/s front end
-    f, prom = find_line(Pw, N, max(1 / 64, baud / 2.4e6), 0.45)
-    if f and prom >= cfg["rate_min_db_wide"]:
-        return baud / f, prom, "wide"
+        return None, None, "no usable bursts"
+    f, prom = find_line(Pw, N, f0 * (1 - frac), f0 * (1 + frac))
+    if f and prom >= min_db:
+        return f, prom, None
     return None, prom, f"clock line too weak ({prom:.1f} dB)"
+
+
+def measure_rate_blind(iq, bursts, baud, cfg, half_frac):
+    """Unknown flowgraph: infer the rate assuming the nominal baud is exact."""
+    Pw, used, N = clock_spectrum(iq, bursts, cfg["max_bursts_for_rate"], half_frac)
+    if used == 0:
+        return None, None
+    f, prom = find_line(Pw, N, max(1 / 64, baud / 2.4e6), 0.45)
+    if f and prom >= cfg["clock_min_db_blind"]:
+        return baud / f, prom
+    return None, prom
 
 
 # ----------------------------------------------------------------------------
@@ -429,16 +466,22 @@ CREATE TABLE IF NOT EXISTS frames (
   idx INTEGER, length INTEGER, data BLOB, sha1 TEXT, UNIQUE (obs_id, sha1));
 CREATE TABLE IF NOT EXISTS telemetry (
   frame_id INTEGER PRIMARY KEY, parser TEXT, fields TEXT, error TEXT);
-CREATE TABLE IF NOT EXISTS rate_cache (
-  flowgraph TEXT, baud INTEGER, sample_rate REAL, n INTEGER, updated_utc TEXT,
-  PRIMARY KEY (flowgraph, baud));
+DROP TABLE IF EXISTS rate_cache;
 CREATE INDEX IF NOT EXISTS frames_norad ON frames (norad_id, start_utc);
 """
+# columns added after 0.1.0 (ALTERed into existing databases)
+NEW_OBS_COLUMNS = {"measured_baud": "REAL", "baud_ppm": "REAL", "baud_source": "TEXT",
+                   "decode_rate": "REAL"}
 
 
 def db_open(path):
     db = sqlite3.connect(path, timeout=30)
     db.executescript(SCHEMA)
+    have = {r[1] for r in db.execute("PRAGMA table_info(observations)")}
+    with db:
+        for col, typ in NEW_OBS_COLUMNS.items():
+            if col not in have:
+                db.execute(f"ALTER TABLE observations ADD COLUMN {col} {typ}")
     return db
 
 
@@ -508,25 +551,49 @@ def process(ctx, obs_id):
         hot1[max(0, a - 3):b + 3] = True
     quiet1 = np.where(~hot1 & (p1 < floor1 + 1.0))[0]
 
-    # --- sample rate
-    row = ctx.db.execute("SELECT sample_rate FROM rate_cache WHERE flowgraph=? AND baud=?",
-                         (flow, baud)).fetchone()
-    cached = row[0] if row else None
-    rate, prom, rate_status = None, None, "unmeasured"
+    # --- sample rate: set by the station's flowgraph (exact), not by the satellite
+    prom, measured_baud, ppm = None, None, None
     if sc.get("sample_rate"):
         rate, rate_status = float(sc["sample_rate"]), "configured"
-    elif baud and coarse:
-        occ = occupied_fraction(iq, coarse, quiet1, 1024)
-        rate, prom, how = measure_rate(iq, coarse, baud, cached, S, occ)
-        if rate:
-            rate_status = "measured"
-            log.info("  rate %.1f S/s (%.3f samples/symbol, clock line %.1f dB, %s, band +-%.3f fs)",
-                     rate, rate / baud, prom, how, occ)
+    else:
+        rate = nominal_rate(flow, baud)
+        rate_status = "computed" if rate else "unknown"
+    occ = occupied_fraction(iq, coarse, quiet1, 1024) if coarse else 0.45
+
+    # --- satellite symbol rate: measured from the clock line, using the known rate
+    if baud and coarse and rate:
+        f, prom, why = measure_clock(iq, coarse, baud / rate, S["baud_search_frac"],
+                                     S["clock_min_db"], S, occ)
+        if f:
+            measured_baud = f * rate
+            ppm = (measured_baud / baud - 1) * 1e6
+            log.info("  rate %.1f S/s (%s); satellite baud %.2f (%+.0f ppm, clock line %.1f dB)",
+                     rate, rate_status, measured_baud, ppm, prom)
+            if abs(ppm) > S["baud_flag_ppm"]:
+                log.warning("  baud %+.0f ppm from nominal: satellite oscillator, or wrong "
+                            "rate rule for %s (see `status` flowgraph check)", ppm, flow)
         else:
-            log.info("  rate not measured: %s", how)
-    if rate is None and cached:
-        rate, rate_status = cached, "cached"
-        log.info("  using cached rate %.1f S/s", rate)
+            log.info("  rate %.1f S/s (%s); baud not measured: %s", rate, rate_status, why)
+    elif baud and coarse:                         # unknown flowgraph: old behaviour
+        rate, prom = measure_rate_blind(iq, coarse, baud, S, occ)
+        rate_status = "inferred" if rate else "unknown"
+        log.info("  unknown flowgraph %s: rate %s (assumes exact %d baud)", flow,
+                 f"{rate:.1f} inferred" if rate else "not found", baud)
+    elif not rate:
+        log.info("  unknown flowgraph %s and no bursts: rate unknown", flow)
+
+    # baud to decode with: this pass, else this satellite's history, else nominal
+    baud_used, baud_source = baud, "nominal"
+    if measured_baud:
+        baud_used, baud_source = measured_baud, "measured"
+    elif baud and norad is not None and rate_status != "inferred":
+        hist = [r[0] for r in ctx.db.execute(
+            "SELECT measured_baud FROM observations WHERE norad_id=? AND baud=? AND obs_id!=? "
+            "AND measured_baud IS NOT NULL ORDER BY start_utc DESC LIMIT 10", (norad, baud, obs_id))]
+        if hist:
+            baud_used, baud_source = float(np.median(hist)), "history"
+            log.info("  using satellite's median baud %.2f from %d earlier passes", baud_used, len(hist))
+    decode_rate = rate * baud / baud_used if rate and baud and baud_used else rate
 
     # --- pass 2: band-limited detection at the true rate (10 ms blocks)
     bursts, meas, block = coarse, [{} for _ in coarse], 1024
@@ -540,7 +607,7 @@ def process(ctx, obs_id):
         for a, b in runs2:
             hot[max(0, a - 5):b + 5] = True
         quiet = np.where(~hot & (p2 < floor + 1.0))[0]
-        meas = measure_bursts(iq, bursts, quiet, block, rate, baud, half_hz)
+        meas = measure_bursts(iq, bursts, quiet, block, rate, baud_used, half_hz)
     log.info("  %d bursts", len(bursts))
 
     # --- decode
@@ -559,7 +626,9 @@ def process(ctx, obs_id):
     elif not rate:
         status, error = "failed", "sample rate unknown"
     else:
-        frames, error = run_decoder(sat_arg, iq, data_path, rate, ctx.work, S)
+        # gr-satellites assumes the SatYAML baud; scaling the rate gives it the
+        # pass's true samples/symbol
+        frames, error = run_decoder(sat_arg, iq, data_path, decode_rate, ctx.work, S)
         status = "decoded" if frames else ("no_frames" if frames is not None else
                                             "no_decoder" if "does not know" in (error or "") else "failed")
         frames = frames or []
@@ -584,12 +653,17 @@ def process(ctx, obs_id):
         db.executemany("DELETE FROM telemetry WHERE frame_id=?", [(i,) for i in old])
         db.execute("DELETE FROM frames WHERE obs_id=?", (obs_id,))
         db.execute("DELETE FROM bursts WHERE obs_id=?", (obs_id,))
-        db.execute("INSERT OR REPLACE INTO observations VALUES "
-                   "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                   (obs_id, norad, g.get("satnogs:satellite_name"), start, freq, baud, flow,
-                    iq.n, rate, rate_status, prom, dur, len(bursts), max(snrs) if snrs else None,
-                    str(sat_arg) if sat_arg is not None else decoder, len(uniq), status, error,
-                    now_utc(), VERSION, data_path))
+        row = {"obs_id": obs_id, "norad_id": norad, "satellite": g.get("satnogs:satellite_name"),
+               "start_utc": start, "freq_hz": freq, "baud": baud, "flowgraph": flow, "n_samples": iq.n,
+               "sample_rate": rate, "rate_status": rate_status, "clock_line_db": prom,
+               "measured_baud": measured_baud, "baud_ppm": ppm, "baud_source": baud_source,
+               "decode_rate": decode_rate, "duration_s": dur, "n_bursts": len(bursts),
+               "best_snr_db": max(snrs) if snrs else None,
+               "decoder": str(sat_arg) if sat_arg is not None else decoder, "n_frames": len(uniq),
+               "status": status, "error": error, "processed_utc": now_utc(),
+               "worker_version": VERSION, "data_path": data_path}
+        db.execute(f"INSERT OR REPLACE INTO observations ({','.join(row)}) "
+                   f"VALUES ({','.join('?' * len(row))})", list(row.values()))
         for i, ((a, b), m) in enumerate(zip(bursts, meas)):
             db.execute("INSERT INTO bursts VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                        (obs_id, i, a, b - a, a / rate if rate else None, (b - a) / rate if rate else None,
@@ -603,20 +677,22 @@ def process(ctx, obs_id):
                 except Exception as e:
                     fields, perr = None, f"{type(e).__name__}: {e}"[:300]
                 db.execute("INSERT INTO telemetry VALUES (?,?,?,?)", (cur.lastrowid, pname, fields, perr))
-        if rate_status == "measured" and baud:
-            db.execute("INSERT INTO rate_cache VALUES (?,?,?,1,?) ON CONFLICT(flowgraph, baud) DO UPDATE "
-                       "SET sample_rate=excluded.sample_rate, n=n+1, updated_utc=excluded.updated_utc",
-                       (flow, baud, rate, now_utc()))
 
     # --- SigMF meta
     if rate:
         g["core:sample_rate"] = rate
-        g["satnogs:samples_per_symbol"] = round(rate / baud, 4) if baud else None
+        g["satnogs:samples_per_symbol"] = round(rate / baud_used, 4) if baud_used else None
     else:
         g.pop("core:sample_rate", None)
     g["satnogs:sample_rate_status"] = rate_status
+    for k in ("satnogs:clock_line_db", "satnogs:measured_baud", "satnogs:baud_offset_ppm"):
+        g.pop(k, None)
     if prom is not None:
         g["satnogs:clock_line_db"] = round(prom, 1)
+    if measured_baud:
+        g["satnogs:measured_baud"] = round(measured_baud, 3)
+        g["satnogs:baud_offset_ppm"] = round(ppm)
+    g["satnogs:baud_source"] = baud_source
     g.update({"satnogs:status": status, "satnogs:bursts": len(bursts), "satnogs:frames": len(uniq),
               "satnogs:decoder": str(sat_arg) if sat_arg is not None else decoder,
               "satnogs:processed": now_utc(), "satnogs:worker_version": VERSION})
@@ -703,15 +779,31 @@ def cmd_status(ctx, _args):
         print(f"  {r[0]:<11} {r[1]}")
     print("recent:")
     for r in ctx.db.execute("SELECT obs_id, satellite, start_utc, n_bursts, n_frames, sample_rate, "
-                            "rate_status, best_snr_db, status FROM observations "
+                            "rate_status, best_snr_db, status, measured_baud, baud_ppm FROM observations "
                             "ORDER BY processed_utc DESC LIMIT 10"):
         snr = f"{r[7]:5.1f}" if r[7] is not None else "  -  "
-        rate = f"{r[5]:9.1f}" if r[5] else "        -"
-        print(f"  {r[0]:>9} {str(r[1])[:16]:<16} {r[2] or '':<20} bursts {r[3] or 0:>3} frames {r[4] or 0:>3} "
-              f"rate {rate} {r[6] or '':<10} snr {snr} {r[8]}")
-    print("rate cache:")
-    for r in ctx.db.execute("SELECT flowgraph, baud, sample_rate, n FROM rate_cache"):
-        print(f"  {r[0]} @ {r[1]} baud: {r[2]:.1f} S/s ({r[3]} passes)")
+        rate = f"{r[5]:8.0f}" if r[5] else "       -"
+        bd = f"{r[9]:8.1f} {r[10]:+6.0f}ppm" if r[9] else f"{'-':>8} {'':9}"
+        print(f"  {r[0]:>9} {str(r[1])[:14]:<14} {(r[2] or '')[:16]:<16} bursts {r[3] or 0:>3} "
+              f"frames {r[4] or 0:>3} rate {rate} {r[6] or '':<9} baud {bd} snr {snr} {r[8]}")
+    # Same offset on every satellite of a flowgraph => station rate rule is wrong;
+    # offset on one satellite only => that satellite's oscillator.
+    print("flowgraph check (median baud offset per satellite):")
+    rows = ctx.db.execute("SELECT flowgraph, baud, norad_id, satellite, baud_ppm FROM observations "
+                          "WHERE baud_ppm IS NOT NULL").fetchall()
+    groups = {}
+    for fg, bd, nd, name, p in rows:
+        groups.setdefault((fg, bd), {}).setdefault((nd, name), []).append(p)
+    if not groups:
+        print("  (no measured passes yet)")
+    for (fg, bd), sats in sorted(groups.items(), key=lambda kv: str(kv[0])):
+        med = {k: float(np.median(v)) for k, v in sats.items()}
+        lst = ", ".join(f"{str(n)[:14]} {m:+.0f} ({len(sats[(nd, n)])})" for (nd, n), m in med.items())
+        note = ""
+        if len(med) >= 3 and all(abs(m) > 500 for m in med.values()) \
+                and np.ptp(list(med.values())) < 300:
+            note = "  <- all satellites agree: check the rate rule for this flowgraph"
+        print(f"  {fg} @ {bd}: {lst}{note}")
     return 0
 
 

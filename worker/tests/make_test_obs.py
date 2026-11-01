@@ -4,7 +4,8 @@
 Writes <dir>/iq/<obs>.sigmf-data (ci16_le) + .sigmf-meta (as satnogs-post
 would) and touches <dir>/queue/<obs>. Used to test satnogs-worker end to end.
 
-  make_test_obs.py DIR OBS_ID [--rate 57597] [--snr-db 10 4 ...] [--seconds 120] [--empty]
+  make_test_obs.py DIR OBS_ID [--rate 57600] [--true-baud 9570] [--flowgraph satnogs_bpsk.py]
+                    [--snr-db 10 4 ...] [--seconds 120] [--empty]
 """
 import argparse
 import json
@@ -75,8 +76,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dir")
     ap.add_argument("obs", type=int)
-    ap.add_argument("--rate", type=float, default=57597.0)
-    ap.add_argument("--baud", type=int, default=9600)
+    ap.add_argument("--rate", type=float, default=57600.0)
+    ap.add_argument("--baud", type=int, default=9600, help="nominal baud (metadata)")
+    ap.add_argument("--true-baud", type=float, help="satellite's actual baud (default: nominal)")
+    ap.add_argument("--flowgraph", default="satnogs_fsk.py")
     ap.add_argument("--seconds", type=float, default=120)
     ap.add_argument("--period", type=float, default=11.0)
     ap.add_argument("--snr-db", type=float, nargs="+", default=[12, 6, 3, 9],
@@ -98,7 +101,7 @@ def main():
         while t < a.seconds - 2:
             info = (f"burst {k} ".encode() + bytes(range(256)))[: (160 if k % 2 == 0 else 54)]
             fr = ax25_frame(info)
-            s = gmsk(frame_bits(fr), a.rate, a.baud, f_off=a.offset_hz)
+            s = gmsk(frame_bits(fr), a.rate, a.true_baud or a.baud, f_off=a.offset_hz)
             snr = a.snr_db[k % len(a.snr_db)]
             i0 = int(t * a.rate)
             x[i0:i0 + len(s)] += s[: n - i0] * 10 ** (snr / 20)
@@ -119,7 +122,7 @@ def main():
         "core:recorder": "satnogs-client IQ dump", "core:description": f"SatNOGS observation {a.obs}",
         "core:extensions": [{"name": "satnogs", "version": "0.1.0", "optional": True}],
         "satnogs:observation_id": a.obs, "satnogs:station_id": 5263, "satnogs:norad_id": a.norad,
-        "satnogs:satellite_name": "TESTSAT", "satnogs:baud": a.baud, "satnogs:flowgraph": "satnogs_fsk.py",
+        "satnogs:satellite_name": "TESTSAT", "satnogs:baud": a.baud, "satnogs:flowgraph": a.flowgraph,
         "satnogs:tle": None, "satnogs:data_bytes": os.path.getsize(data),
         "satnogs:sample_rate_status": "unmeasured", "satnogs:status": "queued"},
         "captures": [{"core:sample_start": 0, "core:frequency": 436650000,

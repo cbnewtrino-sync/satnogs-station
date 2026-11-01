@@ -25,5 +25,6 @@ settings:
   pad_seconds: 3.0
   busy_seconds: 120          # defer while the client is writing an IQ dump
   burst_threshold_db: 3.0
-  rate_min_db_cached: 8.0
-  rate_min_db_wide: 12.0
+  clock_min_db: 8.0          # symbol-clock line needed to measure a satellite's baud
+  baud_search_frac: 0.02     # +-2 % around nominal baud
+  baud_flag_ppm: 1000        # warn above this baud offset

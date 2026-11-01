@@ -43,10 +43,16 @@ journalctl -u satnogs-worker       # logs
 Per observation:
 
 1. **Coarse bursts** — in-band energy on 1024-sample blocks (rate not needed).
-2. **Sample rate** — FM-demod the bursts, band-limited to their occupied
-   bandwidth, find the symbol-clock line; rate = baud / f_line. Searched near
-   the cached rate for this (flowgraph, baud) first, then 2–64 samples/symbol.
-   Too weak → cached rate (`sample_rate_status: cached`).
+2. **Sample rate and satellite baud** — the rate is set by the station's
+   flowgraph, so it is computed (`satnogs_fsk.py` @ 9600 → 57,600;
+   `satnogs_bpsk.py` @ 9600 → 76,800; rule from satnogs-flowgraphs). The
+   symbol-clock line (FM-demod of band-limited bursts) then measures the
+   satellite's *actual* baud, which cheap oscillators put off nominal
+   (`satnogs:measured_baud`, `satnogs:baud_offset_ppm`; warning above
+   1000 ppm). Weak pass → median baud of that satellite's earlier passes.
+   gr-satellites gets rate × nominal/actual baud, i.e. the true samples per
+   symbol. Unknown flowgraph → rate inferred from the clock line assuming
+   the nominal baud (`sample_rate_status: inferred`).
 3. **Bursts at the true rate** — 10 ms blocks, band ±(0.8·baud + 1 kHz).
    Each burst gets SNR (in its 99 % occupied band), Eb/N0, frequency offset
    (power centroid) and edges → SigMF annotations.
@@ -67,7 +73,12 @@ The worker defers while the client is writing `iq/current.raw*` and runs at
 
 `observations`, `bursts` (per-burst SNR/offset/edges), `frames` (raw bytes,
 per observation, deduplicated by SHA-1), `telemetry` (parsed fields as JSON,
-or the parse error), `rate_cache`.
+or the parse error). `observations` holds `sample_rate`, `measured_baud`,
+`baud_ppm`, `baud_source` (measured / history / nominal) and `decode_rate`.
+
+`status` ends with a **flowgraph check**: each satellite's median baud
+offset per flowgraph. One satellite off → its oscillator. Every satellite on a
+flowgraph off by the same amount → the rate rule for that flowgraph is wrong.
 
 ```
 sqlite3 <local>/station.db "select obs_id, satellite, n_bursts, n_frames, round(best_snr_db,1), status from observations order by start_utc desc limit 20"
