@@ -15,6 +15,7 @@ then process it on the host (bursts, true sample rate, decode, telemetry).
 | `worker/satyaml/` | host | custom SatYAML files for gr-satellites |
 | `worker/ksy/` | host | own Kaitai parsers (`.ksy`, or compiled `.py`) |
 | `worker/tests/` | host | synthetic-pass generator and end-to-end test |
+| `build-gr-satellites.sh` | host | build gr-satellites from source into `/usr/local` |
 
 ## Install / update
 
@@ -30,6 +31,21 @@ cd ~/satnogs-station && git pull && sudo ./install.sh
 git, not on the Pi — install overwrites `<local>/worker.yml`.
 
 `<local>` = `/var/lib/docker-bindmounts/satnogs_satnogs-client/opt/satnogs-non-free/local`
+
+## gr-satellites from source
+
+The distribution package lags releases. To build the latest 5.x tag (or a
+given one) and replace the package:
+
+```
+./build-gr-satellites.sh            # latest v5.* tag
+./build-gr-satellites.sh v5.9.0     # specific tag; re-run to upgrade
+```
+
+Installs to `/usr/local` (`/usr/local/bin` comes first on PATH, so the worker
+needs no change). Uses `make -j2` by default (`JOBS=4` to override) because the
+C++/LTO build can exhaust a Pi 4's RAM. Tested on GNU Radio 3.10 with v5.9.0,
+which has SPIRONE built in (identical to `worker/satyaml/SPIRONE.yml`).
 
 ## Worker
 
