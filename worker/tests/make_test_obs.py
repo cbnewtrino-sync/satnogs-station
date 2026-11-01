@@ -72,8 +72,30 @@ def gmsk(bits, rate, baud, bt=0.5, h=0.625, f_off=0.0):
     return np.exp(1j * 2 * np.pi * np.cumsum(freq) / rate)
 
 
+def bpsk(bits, rate, baud, alpha=0.35, f_off=0.0, span=6):
+    """RRC-shaped BPSK, symbols at exactly 1/baud (any rate/baud ratio)."""
+    a = 2.0 * bits - 1
+    n = int(np.ceil((len(bits) + span) * rate / baud))
+    t = np.arange(n) * baud / rate                 # time in symbols
+    y = np.zeros(n)
+    k0 = np.floor(t).astype(int)
+
+    def rrc(x):
+        x = np.where(np.abs(x) < 1e-9, 1e-9, x)
+        x = np.where(np.abs(np.abs(4 * alpha * x) - 1) < 1e-9, x + 1e-6, x)
+        return (np.sin(np.pi * x * (1 - alpha)) + 4 * alpha * x * np.cos(np.pi * x * (1 + alpha))) / \
+               (np.pi * x * (1 - (4 * alpha * x) ** 2))
+    for j in range(-span, span + 1):
+        k = k0 + j
+        ok = (k >= 0) & (k < len(a))
+        y[ok] += a[k[ok]] * rrc(t[ok] - k[ok])
+    y /= np.sqrt(np.mean(y[: int(len(bits) * rate / baud)] ** 2))
+    return y * np.exp(1j * (2 * np.pi * f_off * np.arange(n) / rate + 0.7))
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--mod", choices=["gmsk", "bpsk"], default="gmsk")
     ap.add_argument("dir")
     ap.add_argument("obs", type=int)
     ap.add_argument("--rate", type=float, default=57600.0)
@@ -101,7 +123,8 @@ def main():
         while t < a.seconds - 2:
             info = (f"burst {k} ".encode() + bytes(range(256)))[: (160 if k % 2 == 0 else 54)]
             fr = ax25_frame(info)
-            s = gmsk(frame_bits(fr), a.rate, a.true_baud or a.baud, f_off=a.offset_hz)
+            mod = bpsk if a.mod == "bpsk" else gmsk
+            s = mod(frame_bits(fr), a.rate, a.true_baud or a.baud, f_off=a.offset_hz)
             snr = a.snr_db[k % len(a.snr_db)]
             i0 = int(t * a.rate)
             x[i0:i0 + len(s)] += s[: n - i0] * 10 ** (snr / 20)

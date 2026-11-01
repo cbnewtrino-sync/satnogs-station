@@ -7,7 +7,7 @@ Type=oneshot
 User=pi
 Group=satnogs-client
 UMask=0002
-ExecStart=/opt/satnogs-worker/venv/bin/python /usr/local/bin/satnogs-worker run
+ExecStart=/usr/local/bin/satnogs-worker run
 # stay out of the way of a live observation
 Nice=19
 CPUWeight=10

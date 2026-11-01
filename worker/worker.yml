@@ -18,6 +18,9 @@ defaults:
 
 satellites:
   98492: { decoder: satyaml/SPIRONE.yml, parser: "satnogs:Spirone" }
+  # TEVEL2-1: gr-satellites knows it only by temporary ID 98647; SatNOGS now uses 63217
+  98647: { decoder: TEVEL2-1, parser: "satnogs:Ax25frames" }
+  63217: { decoder: TEVEL2-1, parser: "satnogs:Ax25frames" }
 
 settings:
   gr_satellites: gr_satellites

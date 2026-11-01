@@ -12,7 +12,14 @@ install -m 755 -g satnogs-client satnogs-post *.py "$DEST"/
 echo "installed container scripts to $DEST"
 
 # --- host worker (runs as pi:satnogs-client; needs group write on these dirs)
-install -m 755 worker/satnogs-worker /usr/local/bin/satnogs-worker
+if [[ ! -x $VENV/bin/python ]]; then
+    python3 -m venv --system-site-packages "$VENV"
+fi
+"$VENV/bin/pip" install -q --upgrade satnogs-decoders
+# point the command at the venv so manual runs see satnogs-decoders too
+sed "1s|^#!.*|#!$VENV/bin/python|" worker/satnogs-worker > /tmp/satnogs-worker.$$
+install -m 755 /tmp/satnogs-worker.$$ /usr/local/bin/satnogs-worker
+rm -f /tmp/satnogs-worker.$$
 install -d -m 2775 -g satnogs-client "$LOCAL/iq" "$LOCAL/queue" "$LOCAL/work" "$LOCAL/cache"
 chgrp satnogs-client "$LOCAL" "$LOCAL/iq" "$LOCAL/queue"
 chmod g+rwxs "$LOCAL" "$LOCAL/iq" "$LOCAL/queue"
@@ -21,11 +28,6 @@ install -m 664 -g satnogs-client worker/worker.yml "$LOCAL/worker.yml"
 cp worker/satyaml/*.yml "$LOCAL/satyaml/" 2>/dev/null || true
 cp worker/ksy/*.ksy worker/ksy/*.py "$LOCAL/ksy/" 2>/dev/null || true
 chgrp -R satnogs-client "$LOCAL/satyaml" "$LOCAL/ksy"
-
-if [[ ! -x $VENV/bin/python ]]; then
-    python3 -m venv --system-site-packages "$VENV"
-fi
-"$VENV/bin/pip" install -q --upgrade satnogs-decoders
 
 install -m 644 worker/systemd/satnogs-worker.service worker/systemd/satnogs-worker.timer /etc/systemd/system/
 systemctl daemon-reload
