@@ -79,20 +79,23 @@ Per observation:
    siblings on the same channel (TEVEL2s all use 436.400 MHz). Each group gets
    its own baud measurement and its own decode.
 5. **No bursts → `empty`**, no decode (`always_decode: true` overrides).
-6. **Decode** — per transmitter, gr-satellites on a zero-padded copy in
-   `<local>/work/` in which the other transmitters' bursts are replaced by
-   station noise (they drag the demodulator's frequency tracking otherwise).
-   For BPSK (`satnogs_bpsk.py`) each burst's exact carrier comes from the line
-   at 2·fc in the squared signal; every burst is shifted to 0 Hz and decoded
-   with `--disable_fll`, so the Costas loop locks at once. Coarse
-   (spectral-centroid) offsets are only re-centred beyond 1.5 kHz.
-   gr-satellites' BPSK path is not deterministic run to run, so each decode is
-   repeated (up to `decode_runs`, stopping when two runs agree) and frames are
-   unioned. More runs means more CRC-16 false positives, so when most of a
-   pass's frames are AX.25, frames without a valid AX.25 address field are
-   kept but flagged `valid = 0` and not counted.
-   Real TEVEL2 pass (15330141 slices): 1 → 6 of 6 bursts, including the
-   co-channel sibling (callsign TVL2-2).
+6. **Decode** — per transmitter, gr-satellites runs on a short stream holding
+   only that transmitter's bursts, back to back, each with 0.15 s of noise
+   either side. Long noise gaps let gr-satellites' Costas loop wander hundreds
+   of Hz (measured on TEVEL2: +150…+720 Hz), so it missed the next preamble;
+   with bursts back to back it stays locked. Each burst is centred on its own
+   carrier: for BPSK (`satnogs_bpsk.py`) the line at 2·fc in the squared
+   signal (exact to ~0.1 Hz; rejected if more than 0.2 × baud from the
+   spectral centroid, then filled by interpolating the transmitter's good
+   carriers), decoded with `--disable_fll`; otherwise the centroid, applied
+   only beyond 1.5 kHz. Overlapping bursts of other transmitters are replaced
+   with station noise. Decoding is repeated (up to `decode_runs`, stopping
+   when two runs agree) and frames unioned; more runs mean more CRC-16 false
+   positives, so when most of a pass's frames are AX.25, the others are kept
+   but flagged `valid = 0` and not counted.
+   Real TEVEL2 pass 15330141: 0 → 5 frames from TEVEL2-1 + 3 from the
+   co-channel sibling TVL2-2 (SatNOGS got 1); decode time ~1 s instead of
+   6–13 s per run.
 7. **Parse** — `satnogs:<Class>` (satnogs-decoders) or own Kaitai parser.
 8. **Store** — `<local>/station.db`; meta rewritten with `core:sample_rate`,
    status and annotations. The queue marker is removed even on failure (no

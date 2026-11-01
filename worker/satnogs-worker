@@ -46,7 +46,7 @@ try:
 except ImportError:          # config is optional; defaults work without it
     yaml = None
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 DEFAULT_BASE = "/var/lib/docker-bindmounts/satnogs_satnogs-client/opt/satnogs-non-free/local"
 
 DEFAULTS = {
@@ -73,7 +73,8 @@ SETTINGS = {
     "recentre_min_hz": 1500,        # (centroid estimates only) re-centre when further off than this
     "carrier_min_db": 12.0,         # BPSK: squared-signal line needed to trust the carrier estimate
     "exact_carrier_args": ["--disable_fll"],   # gr-satellites args when all bursts are exactly centred
-    "decode_margin_s": 0.05,
+    "carrier_max_dev": 0.2,         # reject a BPSK carrier further than this x baud from the centroid
+    "decode_margin_s": 0.15,
     "decode_runs": 4,
     "min_frame_len": 8,             # shorter frames are suspect               # max gr-satellites runs per transmitter (union of frames)        # padding around bursts when re-centring / blanking
     "max_bursts_for_rate": 40,
@@ -501,6 +502,61 @@ def patch_decode_copy(path, dtype, shifts, blanks, noise_span):
     del x, raw
 
 
+def build_burst_stream(iq, segs, path, noise, pad):
+    """Write a decoder input containing only the given bursts, back to back.
+    segs: time-ordered (a, b, shift_cycles_per_sample, blanks) where blanks are
+    (a, b) spans inside the segment (other transmitters) to overwrite with
+    station noise. Long noise gaps let gr-satellites' Costas loop wander
+    hundreds of Hz (TEVEL2: +150..+720 Hz) so it misses the next preamble;
+    with ~0.1 s between bursts it stays locked near 0 Hz. complex64 output."""
+    rng = np.random.default_rng(0)
+    last = 0
+    with open(path, "wb") as out:
+        for a, b, f, blanks in segs:
+            a = max(a, last, 0)
+            b = min(b, iq.n)
+            if b <= a:
+                continue
+            x = iq.read(a, b).astype(np.complex128)
+            for c0, c1 in blanks:
+                c0, c1 = max(c0, a), min(c1, b)
+                if c1 > c0:
+                    x[c0 - a:c1 - a] = np.resize(np.roll(noise, int(rng.integers(len(noise)))), c1 - c0) \
+                        if noise is not None and len(noise) else 0
+            if f:
+                x *= np.exp(-2j * np.pi * f * np.arange(a, b))
+            out.write(x.astype(np.complex64).tobytes())
+            last = b
+        out.write(np.zeros(pad, np.complex64).tobytes())
+
+
+def run_grsat(sat_arg, path, flag, rate, cfg, extra=()):
+    """Run gr-satellites on an input file -> (frames, None) or (None, error)."""
+    kiss = path + ".kiss"
+    cmd = [cfg["gr_satellites"], str(sat_arg), flag, path, "--samp_rate", f"{rate:.3f}",
+           "--iq", "--kiss_out", kiss, "--hexdump"] + list(extra)
+    log.debug("decode: %s", " ".join(cmd))
+    t0 = time.time()
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=cfg["decode_timeout_s"], text=True, errors="replace")
+    except subprocess.TimeoutExpired:
+        return None, "gr-satellites timed out"
+    try:
+        err = "\n".join(l for l in (p.stdout or "").splitlines()
+                        if l.strip() and not HEXLINE.match(l)).strip()
+        if "not found" in err and "atellite" in err:
+            return None, f"gr-satellites does not know {sat_arg}"
+        if p.returncode != 0:
+            return None, f"gr-satellites exit {p.returncode}: {err[-400:]}"
+        frames = kiss_frames(open(kiss, "rb").read()) if os.path.exists(kiss) else []
+        log.debug("  decoded %d frames in %.0f s", len(frames), time.time() - t0)
+        return frames, None
+    finally:
+        if os.path.exists(kiss):
+            os.unlink(kiss)
+
+
 HEXLINE = re.compile(r"^[0-9a-f]{4}: |^\*+|^pdu[ _]|^contents")
 
 
@@ -800,6 +856,27 @@ def process(ctx, obs_id):
     if txs and txs[0]["ppm"] is not None and abs(txs[0]["ppm"]) > S["baud_flag_ppm"]:
         log.warning("  baud %+.0f ppm from nominal: satellite oscillator, or wrong rate rule for %s "
                     "(see `status` flowgraph check)", txs[0]["ppm"], flow)
+    # BPSK carriers: the squared-signal line can lock onto something else on
+    # weak bursts (TEVEL2 sibling at ~3 dB: -8411 Hz where its track is -5.7 kHz).
+    # Reject estimates far from the burst's spectral centroid, then fill missing
+    # ones from the same transmitter's good ones (interpolated in time; residual
+    # Doppler drifts smoothly) so every burst can be centred.
+    for i, m in enumerate(meas):
+        if m.get("carrier_hz") is not None and baud and \
+                abs(m["carrier_hz"] - m["centroid_hz"]) > S["carrier_max_dev"] * baud:
+            m["carrier_rejected"] = m["carrier_hz"]
+            m["carrier_hz"] = None
+            m["offset_hz"] = m["centroid_hz"]
+    for t in txs:
+        ex = sorted((bursts[i][0], meas[i]["carrier_hz"]) for i in t["idx"]
+                    if meas[i].get("carrier_hz") is not None)
+        for i in t["idx"]:
+            if ex and meas[i].get("carrier_hz") is None:
+                meas[i]["carrier_fill"] = float(np.interp(bursts[i][0], [e[0] for e in ex], [e[1] for e in ex]))
+    n_rej = sum(1 for m in meas if "carrier_rejected" in m)
+    n_fill = sum(1 for m in meas if "carrier_fill" in m)
+    if n_rej or n_fill:
+        log.info("  carriers: %d rejected as implausible, %d interpolated", n_rej, n_fill)
     t0 = txs[0] if txs else {"baud": None, "ppm": None, "prom": None, "baud_used": baud, "source": "nominal"}
     measured_baud, ppm, prom = t0["baud"], t0["ppm"], t0["prom"] if t0["prom"] is not None else blind_prom
     baud_used, baud_source = t0["baud_used"], t0["source"]
@@ -826,28 +903,26 @@ def process(ctx, obs_id):
         for ti, t in runs:
             if t is not None and ti > 0 and len(t["idx"]) < S["min_bursts_other"]:
                 continue
-            own = set(t["idx"]) if t else set()
+            own = sorted(t["idx"], key=lambda i: bursts[i][0]) if t else []
             cores = [bursts[i] for i in own]
-            # Re-centre bursts on their own carrier. A BPSK carrier from the squared
-            # signal is exact, so always use it -- with the FLL off, gr-satellites'
-            # Costas loop then locks at once (TEVEL2-1: 1 -> 4 of 4 bursts). A
-            # spectral-centroid estimate is coarse; the FLL beats it near 0 Hz, so
-            # those are only re-centred when far off.
-            shifts, all_exact = [], bool(own)
+            others = [(bursts[i][0] - margin, bursts[i][1] + margin) for i in range(len(bursts)) if i not in own]
+            # Decoder input = this transmitter's bursts only, back to back, each
+            # centred on its own carrier: exact (BPSK squared-signal line) or
+            # interpolated -> FLL off, Costas locks at once; otherwise the coarse
+            # centroid, applied only when far off (the FLL does better near 0 Hz).
+            segs, all_centred = [], bool(own)
             for i in own:
                 m = meas[i]
-                if m.get("carrier_hz") is not None:
-                    shifts.append((bursts[i][0] - margin, bursts[i][1] + margin, m["carrier_hz"] / rate))
-                else:
-                    all_exact = False
-                    if abs(m.get("offset_hz") or 0.0) > S["recentre_min_hz"]:
-                        shifts.append((bursts[i][0] - margin, bursts[i][1] + margin, m["offset_hz"] / rate))
-            extra = list(S["exact_carrier_args"]) if all_exact else []
+                c = m.get("carrier_hz") if m.get("carrier_hz") is not None else m.get("carrier_fill")
+                if c is None:
+                    all_centred = False
+                    c = m.get("offset_hz") if abs(m.get("offset_hz") or 0.0) > S["recentre_min_hz"] else 0.0
+                a0, b0 = bursts[i][0] - margin, bursts[i][1] + margin
+                bl = [p for o in others for p in subtract_intervals(o, cores) if p[1] > a0 and p[0] < b0]
+                segs.append((a0, b0, (c or 0.0) / rate, bl))
+            extra = list(S["exact_carrier_args"]) if all_centred else []
             extra += [str(v) for v in (sc.get("decoder_args") or [])]
-            blanks = []
-            for i in range(len(bursts)):
-                if i not in own:
-                    blanks += subtract_intervals((bursts[i][0] - margin, bursts[i][1] + margin), cores)
+            noise = iq.read(*quiet_span).astype(np.complex128) if quiet_span else None
             # gr-satellites assumes the SatYAML baud; scaling the rate gives it
             # this transmitter's true samples/symbol
             dr = rate * baud / t["baud_used"] if t and baud and t["baud_used"] else rate
@@ -855,8 +930,15 @@ def process(ctx, obs_id):
             # scheduling); frames are CRC-checked, so repeat and keep the union.
             # Stop when two runs in a row agree (deterministic decoders, e.g. FSK).
             fr, err, prev, n_runs = [], None, None, 0
+            os.makedirs(ctx.work, exist_ok=True)
+            stream = os.path.join(ctx.work, f"tx{ti}-{os.getpid()}.c64")
+            if own:
+                build_burst_stream(iq, segs, stream, noise, int(S["pad_seconds"] * rate))
             for _ in range(max(1, int(S["decode_runs"]))):
-                got, err = run_decoder(sat_arg, iq, data_path, dr, ctx.work, S, shifts, blanks, quiet_span, extra)
+                if own:
+                    got, err = run_grsat(sat_arg, stream, "--rawfile", dr, S, extra)
+                else:                                   # always_decode, no bursts: whole file
+                    got, err = run_decoder(sat_arg, iq, data_path, dr, ctx.work, S)
                 if got is None:
                     fr = None if not fr else fr
                     break
@@ -866,6 +948,8 @@ def process(ctx, obs_id):
                 if key == prev:
                     break
                 prev = key
+            if os.path.exists(stream):
+                os.unlink(stream)
             if n_runs > 1:
                 log.debug("  transmitter %d: %d decode runs", ti, n_runs)
             if fr is None:
