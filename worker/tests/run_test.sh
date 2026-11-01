@@ -10,10 +10,10 @@ mkdir -p "$T"
 cat > "$T/worker.yml" <<EOT
 satellites:
   98492: { decoder: $HERE/TESTSAT.yml, parser: "satnogs:Ax25frames" }
-  99001: { decoder: $HERE/TESTSAT.yml }
+  99001: { decoder: $HERE/TESTSAT-BPSK.yml }
 EOT
 python3 "$HERE/make_test_obs.py" "$T" 1001 --snr-db 15 9 6 3
-python3 "$HERE/make_test_obs.py" "$T" 1004 --flowgraph satnogs_bpsk.py --rate 76800 --true-baud 9570 --norad 99001 --snr-db 15 9 6 3 --seed 2
+python3 "$HERE/make_test_obs.py" "$T" 1004 --mod bpsk --flowgraph satnogs_bpsk.py --rate 76800 --true-baud 9570 --norad 99001 --snr-db 15 9 6 3 --seed 2
 python3 "$HERE/make_test_obs.py" "$T" 1002 --empty --seconds 60
 python3 "$HERE/make_test_obs.py" "$T" 1003 --snr-db 1 --seed 5
 $PY "$HERE/../satnogs-worker" --base "$T" run

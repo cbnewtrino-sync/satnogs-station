@@ -72,20 +72,27 @@ Per observation:
 3. **Bursts at the true rate** — 10 ms blocks, band ±(0.8·baud + 1 kHz).
    Each burst gets SNR (in its 99 % occupied band), Eb/N0, frequency offset
    (power centroid) and edges → SigMF annotations.
-4. **Transmitters** — bursts are grouped by frequency offset (split at gaps
-   > 1.5 kHz). Group 0, nearest 0 Hz, is the scheduled satellite (the Doppler
-   correction was computed for it); others are e.g. siblings on the same
-   channel (TEVEL2s all use 436.400 MHz). Each group gets its own baud
-   measurement and its own decode.
+4. **Transmitters** — bursts are grouped by frequency offset, following
+   Doppler drift: a burst joins the group whose latest burst is within
+   1.5 kHz + 150 Hz/s × elapsed time. Group 0, nearest 0 Hz, is the scheduled
+   satellite (the Doppler correction was computed for it); others are e.g.
+   siblings on the same channel (TEVEL2s all use 436.400 MHz). Each group gets
+   its own baud measurement and its own decode.
 5. **No bursts → `empty`**, no decode (`always_decode: true` overrides).
 6. **Decode** — per transmitter, gr-satellites on a zero-padded copy in
    `<local>/work/` in which the other transmitters' bursts are replaced by
-   station noise (they otherwise drag the demodulator's frequency tracking —
-   one sibling took a synthetic TEVEL2 pass from 10 frames to 0) and bursts
-   more than 1.5 kHz off-centre are re-centred. gr-satellites' BPSK path is
-   not deterministic run to run, so each decode is repeated (up to
-   `decode_runs`, stopping when two runs agree) and the CRC-checked frames are
-   unioned: 4–11 → 11–18 of 18 frames on the synthetic pass.
+   station noise (they drag the demodulator's frequency tracking otherwise).
+   For BPSK (`satnogs_bpsk.py`) each burst's exact carrier comes from the line
+   at 2·fc in the squared signal; every burst is shifted to 0 Hz and decoded
+   with `--disable_fll`, so the Costas loop locks at once. Coarse
+   (spectral-centroid) offsets are only re-centred beyond 1.5 kHz.
+   gr-satellites' BPSK path is not deterministic run to run, so each decode is
+   repeated (up to `decode_runs`, stopping when two runs agree) and frames are
+   unioned. More runs means more CRC-16 false positives, so when most of a
+   pass's frames are AX.25, frames without a valid AX.25 address field are
+   kept but flagged `valid = 0` and not counted.
+   Real TEVEL2 pass (15330141 slices): 1 → 6 of 6 bursts, including the
+   co-channel sibling (callsign TVL2-2).
 7. **Parse** — `satnogs:<Class>` (satnogs-decoders) or own Kaitai parser.
 8. **Store** — `<local>/station.db`; meta rewritten with `core:sample_rate`,
    status and annotations. The queue marker is removed even on failure (no
@@ -100,7 +107,8 @@ The worker defers while the client is writing `iq/current.raw*` and runs at
 
 `observations`, `transmitters` (per pass: offset, measured baud, frames per
 transmitter), `bursts` (per-burst SNR/offset/edges, `transmitter`), `frames`
-(raw bytes, deduplicated by SHA-1, `transmitter`: 0 = scheduled satellite),
+(raw bytes, deduplicated by SHA-1, `transmitter`: 0 = scheduled satellite,
+`valid`: 0 = suspect),
 `telemetry` (parsed fields as JSON, or the parse error). `observations` holds `sample_rate`, `measured_baud`,
 `baud_ppm`, `baud_source` (measured / history / nominal) and `decode_rate`.
 

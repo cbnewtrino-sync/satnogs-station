@@ -46,7 +46,7 @@ try:
 except ImportError:          # config is optional; defaults work without it
     yaml = None
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 DEFAULT_BASE = "/var/lib/docker-bindmounts/satnogs_satnogs-client/opt/satnogs-non-free/local"
 
 DEFAULTS = {
@@ -66,12 +66,16 @@ SETTINGS = {
     "clock_min_db_blind": 12.0,     # ... for a blind search (unknown flowgraph only)
     "baud_search_frac": 0.02,       # search satellite baud within +-2 % of nominal
     "baud_flag_ppm": 1000,          # warn when a satellite's baud is further off than this
-    "cluster_gap_hz": 1500,         # split bursts into transmitters at offset gaps > this (0 = off)
+    "cluster_gap_hz": 1500,         # bursts further apart in offset are different transmitters (0 = off)
+    "cluster_drift_hz_s": 150,      # ... plus this much per second between them (Doppler drift)
     "max_transmitters": 4,          # decode at most this many transmitters per pass
     "min_bursts_other": 2,          # decode another transmitter only with >= this many bursts
-    "recentre_min_hz": 1500,        # re-centre bursts further off than this before decoding
+    "recentre_min_hz": 1500,        # (centroid estimates only) re-centre when further off than this
+    "carrier_min_db": 12.0,         # BPSK: squared-signal line needed to trust the carrier estimate
+    "exact_carrier_args": ["--disable_fll"],   # gr-satellites args when all bursts are exactly centred
     "decode_margin_s": 0.05,
-    "decode_runs": 4,               # max gr-satellites runs per transmitter (union of frames)        # padding around bursts when re-centring / blanking
+    "decode_runs": 4,
+    "min_frame_len": 8,             # shorter frames are suspect               # max gr-satellites runs per transmitter (union of frames)        # padding around bursts when re-centring / blanking
     "max_bursts_for_rate": 40,
 }
 
@@ -277,7 +281,22 @@ def psd(x, nfft):
     return np.fft.fftshift((np.abs(np.fft.fft(seg, axis=1)) ** 2).mean(axis=0))
 
 
-def measure_bursts(iq, bursts, quiet_blocks, block, rate, baud, half_hz):
+def square_carrier(seg, rate, half_hz, min_db):
+    """BPSK carrier from the line at 2*fc in the squared signal (removes the
+    +-1 modulation). Exact to ~0.1 Hz, unlike the spectral centroid. Not valid
+    for FSK/GMSK, whose squared spectrum has lines at fc +- baud/4."""
+    if len(seg) < 1024:
+        return None, None
+    N = 1 << int(min(19, np.ceil(np.log2(4 * len(seg)))))
+    S = np.abs(np.fft.fft(seg.astype(np.complex64) ** 2, N))
+    f = np.fft.fftfreq(N, 1 / rate) / 2
+    band = np.abs(f) <= half_hz
+    k = np.flatnonzero(band)[np.argmax(S[band])]
+    prom = 10 * np.log10(S[k] / (np.median(S[band]) + 1e-30))
+    return (float(f[k]), float(prom)) if prom >= min_db else (None, float(prom))
+
+
+def measure_bursts(iq, bursts, quiet_blocks, block, rate, baud, half_hz, carrier_min_db=None):
     nfft = int(2 ** np.clip(np.round(np.log2(rate / 200)), 6, 12))   # ~200 Hz bins
     f = np.fft.fftshift(np.fft.fftfreq(nfft, 1 / rate))
     band = np.abs(f) <= half_hz
@@ -307,32 +326,43 @@ def measure_bursts(iq, bursts, quiet_blocks, block, rate, baud, half_hz):
         s, n = ex[occ].sum(), Pn[occ].sum()
         bw = max(hi - lo, rate / nfft)
         snr = 10 * np.log10(s / n) if n > 0 and s > 0 else None
-        out.append({
-            "offset_hz": float((f * ex).sum() / tot),
-            "lo_hz": float(lo), "hi_hz": float(hi),
-            "snr_db": snr,
-            "ebn0_db": snr + 10 * np.log10(bw / baud) if snr is not None and baud else None,
-        })
+        m = {"offset_hz": float((f * ex).sum() / tot), "centroid_hz": float((f * ex).sum() / tot),
+             "lo_hz": float(lo), "hi_hz": float(hi), "snr_db": snr,
+             "ebn0_db": snr + 10 * np.log10(bw / baud) if snr is not None and baud else None,
+             "carrier_hz": None, "carrier_db": None}
+        if carrier_min_db is not None:
+            m["carrier_hz"], m["carrier_db"] = square_carrier(iq.read(a, b), rate, half_hz, carrier_min_db)
+            if m["carrier_hz"] is not None:
+                m["offset_hz"] = m["carrier_hz"]
+        out.append(m)
     return out
 
 
-def group_bursts(meas, gap_hz):
-    """Group bursts into transmitters by frequency offset (split where sorted
-    offsets jump by more than gap_hz). Group 0 = median offset nearest 0 Hz.
-    Bursts without an offset estimate join group 0. gap_hz 0 = one group."""
+def group_bursts(meas, times, gap_hz, drift_hz_s):
+    """Group bursts into transmitters by frequency offset, following drift:
+    in time order, a burst joins the group whose latest burst is within
+    gap_hz + drift_hz_s * dt of it (closest wins), else starts a new group.
+    A co-channel sibling's residual Doppler drifts (TEVEL2: ~100 Hz/s);
+    the scheduled satellite's stays put. Group 0 = median offset nearest
+    0 Hz. Bursts without an offset estimate join group 0. gap_hz 0 = one group."""
     if not meas:
         return []
-    have = sorted((i for i, m in enumerate(meas) if m.get("offset_hz") is not None),
-                  key=lambda i: meas[i]["offset_hz"])
+    have = sorted((i for i, m in enumerate(meas) if m.get("offset_hz") is not None), key=lambda i: times[i])
     rest = [i for i, m in enumerate(meas) if m.get("offset_hz") is None]
     if not have or not gap_hz:
         return [list(range(len(meas)))]
-    groups = [[have[0]]]
-    for i in have[1:]:
-        if meas[i]["offset_hz"] - meas[groups[-1][-1]]["offset_hz"] > gap_hz:
+    groups = []
+    for i in have:
+        best, best_d = None, None
+        for gr in groups:
+            j = gr[-1]
+            d = abs(meas[i]["offset_hz"] - meas[j]["offset_hz"])
+            if d <= gap_hz + drift_hz_s * (times[i] - times[j]) and (best_d is None or d < best_d):
+                best, best_d = gr, d
+        if best is None:
             groups.append([i])
         else:
-            groups[-1].append(i)
+            best.append(i)
     groups.sort(key=lambda gr: (abs(float(np.median([meas[i]["offset_hz"] for i in gr]))), -len(gr)))
     groups[0] += rest
     return [sorted(gr) for gr in groups]
@@ -369,6 +399,33 @@ def subtract_intervals(iv, cuts):
 # ----------------------------------------------------------------------------
 # Decoding
 # ----------------------------------------------------------------------------
+def ax25_header_ok(b):
+    """True if b starts with a well-formed AX.25 address field: 2..10 7-byte
+    addresses of shifted printable callsign characters (strictly [A-Z0-9 ],
+    but satellites use others, e.g. TEVEL2's "TLV2-1"), extension bit only on
+    the last address, control byte after it."""
+    for k in range(10):
+        a = b[7 * k:7 * k + 7]
+        if len(a) < 7:
+            return False
+        if any(c & 1 or not 32 <= c >> 1 <= 126 for c in a[:6]):
+            return False
+        if a[6] & 1:
+            return k >= 1 and len(b) > 7 * k + 7      # control byte must follow
+    return False
+
+
+def frame_validity(frames, min_len):
+    """Repeated decode runs give CRC-16 false positives more chances (1 in 65536
+    each). If most frames are AX.25, flag the ones that aren't."""
+    ok_len = [len(f) >= min_len for f in frames]
+    ax = [ax25_header_ok(f) for f in frames]
+    n_ax = sum(ax)
+    if n_ax >= 2 and n_ax >= 0.6 * len(frames):
+        return [a and l for a, l in zip(ax, ok_len)]
+    return ok_len
+
+
 def kiss_frames(buf):
     frames = []
     for chunk in buf.split(b"\xc0"):
@@ -447,7 +504,7 @@ def patch_decode_copy(path, dtype, shifts, blanks, noise_span):
 HEXLINE = re.compile(r"^[0-9a-f]{4}: |^\*+|^pdu[ _]|^contents")
 
 
-def run_decoder(sat_arg, iq, data_path, rate, work, cfg, shifts=(), blanks=(), noise_span=None):
+def run_decoder(sat_arg, iq, data_path, rate, work, cfg, shifts=(), blanks=(), noise_span=None, extra=()):
     os.makedirs(work, exist_ok=True)
     tag = f"{os.getpid()}"
     padded, kiss = os.path.join(work, f"in-{tag}.raw"), os.path.join(work, f"out-{tag}.kiss")
@@ -457,7 +514,7 @@ def run_decoder(sat_arg, iq, data_path, rate, work, cfg, shifts=(), blanks=(), n
             patch_decode_copy(padded, np.float32 if flag == "--rawfile" else np.int16,
                               shifts, blanks, noise_span)
         cmd = [cfg["gr_satellites"], str(sat_arg), flag, padded, "--samp_rate", f"{rate:.3f}",
-               "--iq", "--kiss_out", kiss, "--hexdump"]
+               "--iq", "--kiss_out", kiss, "--hexdump"] + list(extra)
         log.debug("decode: %s", " ".join(cmd))
         t0 = time.time()
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -580,8 +637,8 @@ CREATE INDEX IF NOT EXISTS frames_norad ON frames (norad_id, start_utc);
 NEW_COLUMNS = {
     "observations": {"measured_baud": "REAL", "baud_ppm": "REAL", "baud_source": "TEXT",
                      "decode_rate": "REAL", "n_bursts_other": "INTEGER", "n_frames_other": "INTEGER"},
-    "bursts": {"transmitter": "INTEGER"},       # 0 = scheduled satellite
-    "frames": {"transmitter": "INTEGER"},
+    "bursts": {"transmitter": "INTEGER", "carrier_hz": "REAL", "carrier_db": "REAL"},  # 0 = scheduled
+    "frames": {"transmitter": "INTEGER", "valid": "INTEGER DEFAULT 1"},   # valid 0 = suspect
 }
 
 
@@ -693,7 +750,8 @@ def process(ctx, obs_id):
         for a, b in runs2:
             hot[max(0, a - 5):b + 5] = True
         quiet = np.where(~hot & (p2 < floor + 1.0))[0]
-        meas = measure_bursts(iq, bursts, quiet, block, rate, baud, half_hz)
+        meas = measure_bursts(iq, bursts, quiet, block, rate, baud, half_hz,
+                              S["carrier_min_db"] if "_bpsk" in flow else None)
         quiet_span = longest_run(quiet, block)
     log.info("  %d bursts", len(bursts))
 
@@ -701,7 +759,8 @@ def process(ctx, obs_id):
     # is the scheduled satellite, since the Doppler correction was computed for it;
     # other groups are e.g. siblings sharing the channel. Each group gets its own
     # baud measurement and its own decode run (see run_decoder).
-    groups = group_bursts(meas, S["cluster_gap_hz"]) if bursts else []
+    groups = group_bursts(meas, [a / rate if rate else a for a, _ in bursts], S["cluster_gap_hz"],
+                          S["cluster_drift_hz_s"]) if bursts else []
     tx_of = {}
     txs = []
     for ti, members in enumerate(groups):
@@ -769,10 +828,22 @@ def process(ctx, obs_id):
                 continue
             own = set(t["idx"]) if t else set()
             cores = [bursts[i] for i in own]
-            # re-centre only bursts well off-centre: near 0 Hz the demodulator's FLL
-            # does better than our per-burst offset estimate
-            shifts = [(bursts[i][0] - margin, bursts[i][1] + margin, (meas[i].get("offset_hz") or 0.0) / rate)
-                      for i in own if abs(meas[i].get("offset_hz") or 0.0) > S["recentre_min_hz"]]
+            # Re-centre bursts on their own carrier. A BPSK carrier from the squared
+            # signal is exact, so always use it -- with the FLL off, gr-satellites'
+            # Costas loop then locks at once (TEVEL2-1: 1 -> 4 of 4 bursts). A
+            # spectral-centroid estimate is coarse; the FLL beats it near 0 Hz, so
+            # those are only re-centred when far off.
+            shifts, all_exact = [], bool(own)
+            for i in own:
+                m = meas[i]
+                if m.get("carrier_hz") is not None:
+                    shifts.append((bursts[i][0] - margin, bursts[i][1] + margin, m["carrier_hz"] / rate))
+                else:
+                    all_exact = False
+                    if abs(m.get("offset_hz") or 0.0) > S["recentre_min_hz"]:
+                        shifts.append((bursts[i][0] - margin, bursts[i][1] + margin, m["offset_hz"] / rate))
+            extra = list(S["exact_carrier_args"]) if all_exact else []
+            extra += [str(v) for v in (sc.get("decoder_args") or [])]
             blanks = []
             for i in range(len(bursts)):
                 if i not in own:
@@ -785,7 +856,7 @@ def process(ctx, obs_id):
             # Stop when two runs in a row agree (deterministic decoders, e.g. FSK).
             fr, err, prev, n_runs = [], None, None, 0
             for _ in range(max(1, int(S["decode_runs"]))):
-                got, err = run_decoder(sat_arg, iq, data_path, dr, ctx.work, S, shifts, blanks, quiet_span)
+                got, err = run_decoder(sat_arg, iq, data_path, dr, ctx.work, S, shifts, blanks, quiet_span, extra)
                 if got is None:
                     fr = None if not fr else fr
                     break
@@ -823,8 +894,14 @@ def process(ctx, obs_id):
             if h not in seen:
                 seen.add(h)
                 uniq.append((fr, h, ti))
-    n_main = sum(1 for u in uniq if u[2] == 0)
-    n_other = len(uniq) - n_main
+    valid = frame_validity([u[0] for u in uniq], S["min_frame_len"])
+    n_bad = valid.count(False)
+    if n_bad:
+        log.info("  %d suspect frame(s) kept but not counted (CRC false positive?)", n_bad)
+    n_main = sum(1 for u, v in zip(uniq, valid) if v and u[2] == 0)
+    n_other = sum(1 for u, v in zip(uniq, valid) if v and u[2] != 0)
+    if status == "decoded" and not n_main + n_other:
+        status = "no_frames"
 
     pname, pfn = ctx.parser(sc.get("parser", "none"))
     start = cap.get("core:datetime")
@@ -855,17 +932,18 @@ def process(ctx, obs_id):
         for ti, t in enumerate(txs):
             db.execute("INSERT INTO transmitters VALUES (?,?,?,?,?,?,?,?,?)",
                        (obs_id, ti, len(t["idx"]), t["offset_hz"], t["baud"], t["ppm"], t["prom"],
-                        t["source"], sum(1 for u in uniq if u[2] == ti)))
+                        t["source"], sum(1 for u, v in zip(uniq, valid) if v and u[2] == ti)))
         for i, ((a, b), m) in enumerate(zip(bursts, meas)):
             db.execute("INSERT INTO bursts (obs_id, idx, sample_start, sample_count, t_offset_s, duration_s, "
-                       "snr_db, ebn0_db, offset_hz, lo_hz, hi_hz, transmitter) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                       "snr_db, ebn0_db, offset_hz, lo_hz, hi_hz, transmitter, carrier_hz, carrier_db) "
+                       "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                        (obs_id, i, a, b - a, a / rate if rate else None, (b - a) / rate if rate else None,
                         m.get("snr_db"), m.get("ebn0_db"), m.get("offset_hz"), m.get("lo_hz"), m.get("hi_hz"),
-                        tx_of.get(i)))
-        for i, (fr, h, ti) in enumerate(uniq):
+                        tx_of.get(i), m.get("carrier_hz"), m.get("carrier_db")))
+        for i, ((fr, h, ti), ok) in enumerate(zip(uniq, valid)):
             cur = db.execute("INSERT INTO frames (obs_id, norad_id, start_utc, idx, length, data, sha1, "
-                             "transmitter) VALUES (?,?,?,?,?,?,?,?)",
-                             (obs_id, norad, start, i, len(fr), fr, h, ti))
+                             "transmitter, valid) VALUES (?,?,?,?,?,?,?,?,?)",
+                             (obs_id, norad, start, i, len(fr), fr, h, ti, int(ok)))
             if pfn:
                 try:
                     fields, perr = json.dumps(jsonable(pfn(fr))), None
@@ -891,7 +969,7 @@ def process(ctx, obs_id):
     g["satnogs:transmitters"] = [
         {"index": ti, "bursts": len(t["idx"]), "offset_hz": round(t["offset_hz"]),
          "measured_baud": round(t["baud"], 3) if t["baud"] else None,
-         "frames": sum(1 for u in uniq if u[2] == ti)} for ti, t in enumerate(txs)]
+         "frames": sum(1 for u, v in zip(uniq, valid) if v and u[2] == ti)} for ti, t in enumerate(txs)]
     g.update({"satnogs:status": status, "satnogs:bursts": row["n_bursts"],
               "satnogs:bursts_other": row["n_bursts_other"], "satnogs:frames": n_main,
               "satnogs:frames_other": n_other,
@@ -912,6 +990,8 @@ def process(ctx, obs_id):
             ann["core:freq_upper_edge"] = round(freq + m["hi_hz"], 1)
         if m:
             ann["satnogs:offset_hz"] = round(m["offset_hz"], 1)
+            if m.get("carrier_hz") is not None:
+                ann["satnogs:carrier_hz"] = round(m["carrier_hz"], 1)
             if m.get("snr_db") is not None:
                 ann["satnogs:snr_db"] = round(m["snr_db"], 2)
                 ann["satnogs:ebn0_db"] = round(m["ebn0_db"], 2)
