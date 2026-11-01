@@ -72,11 +72,22 @@ Per observation:
 3. **Bursts at the true rate** — 10 ms blocks, band ±(0.8·baud + 1 kHz).
    Each burst gets SNR (in its 99 % occupied band), Eb/N0, frequency offset
    (power centroid) and edges → SigMF annotations.
-4. **No bursts → `empty`**, no decode (`always_decode: true` overrides).
-5. **Decode** — gr-satellites on a zero-padded copy in `<local>/work/`; frames
-   from its KISS output, de-duplicated.
-6. **Parse** — `satnogs:<Class>` (satnogs-decoders) or own Kaitai parser.
-7. **Store** — `<local>/station.db`; meta rewritten with `core:sample_rate`,
+4. **Transmitters** — bursts are grouped by frequency offset (split at gaps
+   > 1.5 kHz). Group 0, nearest 0 Hz, is the scheduled satellite (the Doppler
+   correction was computed for it); others are e.g. siblings on the same
+   channel (TEVEL2s all use 436.400 MHz). Each group gets its own baud
+   measurement and its own decode.
+5. **No bursts → `empty`**, no decode (`always_decode: true` overrides).
+6. **Decode** — per transmitter, gr-satellites on a zero-padded copy in
+   `<local>/work/` in which the other transmitters' bursts are replaced by
+   station noise (they otherwise drag the demodulator's frequency tracking —
+   one sibling took a synthetic TEVEL2 pass from 10 frames to 0) and bursts
+   more than 1.5 kHz off-centre are re-centred. gr-satellites' BPSK path is
+   not deterministic run to run, so each decode is repeated (up to
+   `decode_runs`, stopping when two runs agree) and the CRC-checked frames are
+   unioned: 4–11 → 11–18 of 18 frames on the synthetic pass.
+7. **Parse** — `satnogs:<Class>` (satnogs-decoders) or own Kaitai parser.
+8. **Store** — `<local>/station.db`; meta rewritten with `core:sample_rate`,
    status and annotations. The queue marker is removed even on failure (no
    retry loop) — fix and use `reprocess`.
 
@@ -87,9 +98,10 @@ The worker defers while the client is writing `iq/current.raw*` and runs at
 
 ### SQLite tables
 
-`observations`, `bursts` (per-burst SNR/offset/edges), `frames` (raw bytes,
-per observation, deduplicated by SHA-1), `telemetry` (parsed fields as JSON,
-or the parse error). `observations` holds `sample_rate`, `measured_baud`,
+`observations`, `transmitters` (per pass: offset, measured baud, frames per
+transmitter), `bursts` (per-burst SNR/offset/edges, `transmitter`), `frames`
+(raw bytes, deduplicated by SHA-1, `transmitter`: 0 = scheduled satellite),
+`telemetry` (parsed fields as JSON, or the parse error). `observations` holds `sample_rate`, `measured_baud`,
 `baud_ppm`, `baud_source` (measured / history / nominal) and `decode_rate`.
 
 `status` ends with a **flowgraph check**: each satellite's median baud

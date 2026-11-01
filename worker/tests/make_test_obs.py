@@ -104,6 +104,9 @@ def main():
     ap.add_argument("--flowgraph", default="satnogs_fsk.py")
     ap.add_argument("--seconds", type=float, default=120)
     ap.add_argument("--period", type=float, default=11.0)
+    ap.add_argument("--start", type=float, default=2.0, help="first burst time (s)")
+    ap.add_argument("--interferer", nargs=4, type=float, metavar=("BAUD", "OFFSET_HZ", "PERIOD", "SNR_DB"),
+                    help="add a second satellite on the same channel (bursts start at period/2)")
     ap.add_argument("--snr-db", type=float, nargs="+", default=[12, 6, 3, 9],
                     help="in-band (+-baud) SNR per burst, cycled")
     ap.add_argument("--offset-hz", type=float, default=400.0)
@@ -119,7 +122,7 @@ def main():
     x = (np.random.randn(n) + 1j * np.random.randn(n)) * sigma
     truth = []
     if not a.empty:
-        t, k = 2.0, 0
+        t, k = a.start, 0
         while t < a.seconds - 2:
             info = (f"burst {k} ".encode() + bytes(range(256)))[: (160 if k % 2 == 0 else 54)]
             fr = ax25_frame(info)
@@ -131,7 +134,18 @@ def main():
             truth.append({"t": t, "len": len(fr), "snr_db": snr})
             t += a.period
             k += 1
-    x *= 1500 / sigma / 4                       # noise ~1500/4 RMS counts, like the real station
+    if a.interferer and not a.empty:
+        ibaud, ioff, iper, isnr = a.interferer
+        t, k = a.start + iper / 2, 0
+        while t < a.seconds - 2:
+            fr = ax25_frame((f"other {k} ".encode() + bytes(range(256)) * 2)[:280], src="OTHER")
+            mod = bpsk if a.mod == "bpsk" else gmsk
+            s = mod(frame_bits(fr), a.rate, ibaud, f_off=ioff)
+            i0 = int(t * a.rate)
+            x[i0:i0 + len(s)] += s[: n - i0] * 10 ** (isnr / 20)
+            t += iper
+            k += 1
+    x *= 1500 / sigma / 4                      # noise ~1500/4 RMS counts, like the real station
     iq = np.empty(2 * n, np.int16)
     iq[0::2] = np.clip(np.round(x.real), -32768, 32767)
     iq[1::2] = np.clip(np.round(x.imag), -32768, 32767)
