@@ -3,6 +3,9 @@
 Scripts for SatNOGS station 5263: archive every observation's IQ dump as SigMF,
 then process it on the host (bursts, true sample rate, decode, telemetry).
 
+See [docs/signal-layers.md](docs/signal-layers.md) for how bursts, frames and
+payloads relate, and which tool handles each layer.
+
 ## Layout
 
 | Path | Runs | Purpose |
