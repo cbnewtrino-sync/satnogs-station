@@ -21,6 +21,8 @@ satellites:
   # TEVEL2-1: gr-satellites knows it only by temporary ID 98647; SatNOGS now uses 63217
   98647: { decoder: TEVEL2-1, parser: "satnogs:Ax25frames" }
   63217: { decoder: TEVEL2-1, parser: "satnogs:Ax25frames" }
+  # ALSAT-1N: not in gr-satellites; framing worked out from obs 15335933
+  41789: { decoder: satyaml/ALSAT-1N.yml, parser: "satnogs:Alsat1n", frame_prefix: "414c314e00" }
 
 settings:
   gr_satellites: gr_satellites

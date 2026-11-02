@@ -33,6 +33,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -46,7 +47,7 @@ try:
 except ImportError:          # config is optional; defaults work without it
     yaml = None
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 DEFAULT_BASE = "/var/lib/docker-bindmounts/satnogs_satnogs-client/opt/satnogs-non-free/local"
 
 DEFAULTS = {
@@ -76,6 +77,7 @@ SETTINGS = {
     "carrier_max_dev": 0.2,         # reject a BPSK carrier further than this x baud from the centroid
     "decode_margin_s": 0.15,
     "decode_runs": 4,
+    "fsk_deviation_sweep": [5000, 3000, 2400, 2000, 1500],   # Hz; one gr-satellites run each
     "min_frame_len": 8,             # shorter frames are suspect               # max gr-satellites runs per transmitter (union of frames)        # padding around bursts when re-centring / blanking
     "max_bursts_for_rate": 40,
 }
@@ -934,20 +936,38 @@ def process(ctx, obs_id):
             stream = os.path.join(ctx.work, f"tx{ti}-{os.getpid()}.c64")
             if own:
                 build_burst_stream(iq, segs, stream, noise, int(S["pad_seconds"] * rate))
-            for _ in range(max(1, int(S["decode_runs"]))):
+            # FSK: gr-satellites sizes its filters from --deviation (default 5 kHz);
+            # the best value varies by satellite (ALSAT-1N: 2 kHz -> 4 frames,
+            # 5 kHz -> 1), so sweep it, one run each (FSK decoding is
+            # deterministic). BPSK: repeat runs (not deterministic). Frames are
+            # CRC-checked either way; keep the union.
+            if "_bpsk" in flow or "--deviation" in extra:
+                variants = [[]] * max(1, int(S["decode_runs"]))
+                repeat = True
+            else:
+                variants = [["--deviation", str(d)] for d in S["fsk_deviation_sweep"]] or [[]]
+                repeat = False
+            hits = {}
+            for v in variants:
                 if own:
-                    got, err = run_grsat(sat_arg, stream, "--rawfile", dr, S, extra)
+                    got, err = run_grsat(sat_arg, stream, "--rawfile", dr, S, extra + v)
                 else:                                   # always_decode, no bursts: whole file
                     got, err = run_decoder(sat_arg, iq, data_path, dr, ctx.work, S)
                 if got is None:
                     fr = None if not fr else fr
                     break
                 n_runs += 1
-                fr += [x for x in got if x not in fr]
+                new = [x for x in got if x not in fr]
+                fr += new
+                if v:
+                    hits[" ".join(v)] = len(set(got))
                 key = sorted(set(got))
-                if key == prev:
+                if repeat and key == prev:
                     break
                 prev = key
+            if hits:
+                log.info("  transmitter %d: frames per FSK setting %s",
+                         ti, ", ".join(f"{k.split()[-1]} Hz: {n}" for k, n in hits.items()))
             if os.path.exists(stream):
                 os.unlink(stream)
             if n_runs > 1:
@@ -979,6 +999,9 @@ def process(ctx, obs_id):
                 seen.add(h)
                 uniq.append((fr, h, ti))
     valid = frame_validity([u[0] for u in uniq], S["min_frame_len"])
+    prefix = bytes.fromhex(str(sc.get("frame_prefix") or "").replace(" ", ""))
+    if prefix:                                  # satellite-specific start, e.g. ALSAT-1N "AL1N\0"
+        valid = [v and u[0].startswith(prefix) for u, v in zip(uniq, valid)]
     n_bad = valid.count(False)
     if n_bad:
         log.info("  %d suspect frame(s) kept but not counted (CRC false positive?)", n_bad)
@@ -1179,7 +1202,34 @@ def cmd_status(ctx, _args):
     return 0
 
 
+def cmd_frames(ctx, args):
+    rows = ctx.db.execute(
+        "SELECT f.frame_id, f.obs_id, f.transmitter, f.valid, f.length, f.data, t.parser, t.fields, t.error "
+        "FROM frames f LEFT JOIN telemetry t USING (frame_id) WHERE f.obs_id IN (%s) "
+        "ORDER BY f.obs_id, f.transmitter, f.idx" % ",".join("?" * len(args.ids)), args.ids).fetchall()
+    if not rows:
+        print("no frames")
+    for fid, obs, tx, ok, n, data, parser, fields, err in rows:
+        if not ok and not args.all:
+            continue
+        tag = "scheduled" if tx == 0 else f"other #{tx}"
+        print(f"obs {obs}  frame {fid}  transmitter {tx} ({tag})  {n} bytes{'' if ok else '  [SUSPECT]'}")
+        for o in range(0, len(data), 16):
+            chunk = data[o:o + 16]
+            asc = "".join(chr(c) if 32 <= c < 127 else "." for c in chunk)
+            print(f"  {o:04x}  {chunk.hex(' '):<47}  {asc}")
+        if fields:
+            f = json.loads(fields)
+            if isinstance(f, dict):
+                print("  " + "  ".join(f"{k}={v}" for k, v in f.items()))
+        elif err:
+            print(f"  parse error ({parser}): {err}")
+        print()
+    return 0
+
+
 def main():
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)      # quiet exit when piped into head/less
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base", default=os.environ.get("SATNOGS_LOCAL", DEFAULT_BASE))
     ap.add_argument("--config")
@@ -1191,6 +1241,9 @@ def main():
     rp = sub.add_parser("reprocess")
     rp.add_argument("ids", nargs="+", type=int)
     sub.add_parser("status")
+    fp = sub.add_parser("frames", help="print decoded frames and telemetry")
+    fp.add_argument("ids", nargs="+", type=int)
+    fp.add_argument("--all", action="store_true", help="include suspect frames")
     args = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s %(message)s" if os.environ.get("INVOCATION_ID")
@@ -1203,6 +1256,8 @@ def main():
         os.makedirs(d, exist_ok=True)
     if args.cmd == "status":
         return cmd_status(ctx, args)
+    if args.cmd == "frames":
+        return cmd_frames(ctx, args)
     if args.cmd == "reprocess":
         args.max = len(args.ids)
         return cmd_run(ctx, args, ids=args.ids)

@@ -52,7 +52,8 @@ which has SPIRONE built in (identical to `worker/satyaml/SPIRONE.yml`).
 ```
 satnogs-worker run                 # process queue/ (what the timer does)
 satnogs-worker reprocess 1234 1235 # redo observations (after a config change)
-satnogs-worker status              # queue, recent results, rate cache
+satnogs-worker status              # queue, recent results, flowgraph check
+satnogs-worker frames 1234         # decoded frames as hex + parsed telemetry (--all: incl. suspect)
 journalctl -u satnogs-worker       # logs
 ```
 
@@ -93,6 +94,12 @@ Per observation:
    when two runs agree) and frames unioned; more runs mean more CRC-16 false
    positives, so when most of a pass's frames are AX.25, the others are kept
    but flagged `valid = 0` and not counted.
+   FSK transmitters are decoded once at each of several `--deviation`
+   settings (5, 3, 2.4, 2, 1.5 kHz) and the frames unioned: gr-satellites
+   sizes its filters from it, defaults to 5 kHz, and the best value varies
+   (ALSAT-1N: 1 frame at 5 kHz, 4 at 2 kHz).
+   Per satellite, `frame_prefix: "<hex>"` flags frames not starting with it
+   (catches CRC false positives on non-AX.25 satellites).
    Real TEVEL2 pass 15330141: 0 → 5 frames from TEVEL2-1 + 3 from the
    co-channel sibling TVL2-2 (SatNOGS got 1); decode time ~1 s instead of
    6–13 s per run.

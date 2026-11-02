@@ -1,0 +1,19 @@
+# ALSAT-1N — not in gr-satellites (5.9.0). Framing found from station 5263
+# obs 15335933 by locating SatNOGS-decoded frames in the demodulated bits:
+# 9k6 FSK, G3RUH scrambler + NRZI, HDLC (one 0x7E flag after a long 0101
+# preamble), CRC-16/X.25, LSB-first -- i.e. the AX.25 G3RUH physical layer
+# and HDLC framing, but the payload has no AX.25 address header: it starts
+# with "AL1N\0". Parse with satnogs-decoders Alsat1n.
+name: ALSAT-1N
+norad: 41789
+data:
+  &tlm Telemetry:
+    unknown
+transmitters:
+  9k6 FSK downlink:
+    frequency: 437.650e+6
+    modulation: FSK
+    baudrate: 9600
+    framing: AX.25 G3RUH
+    data:
+    - *tlm
