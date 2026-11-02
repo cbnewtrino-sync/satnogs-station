@@ -57,6 +57,7 @@ satnogs-worker run                 # process queue/ (what the timer does)
 satnogs-worker reprocess 1234 1235 # redo observations (after a config change)
 satnogs-worker status              # queue, recent results, flowgraph check
 satnogs-worker frames 1234         # decoded frames as hex + parsed telemetry (--all: incl. suspect)
+satnogs-worker retention           # IQ files past their retention limit (--apply deletes them)
 journalctl -u satnogs-worker       # logs
 ```
 
@@ -115,6 +116,28 @@ Statuses: `decoded`, `no_frames`, `empty`, `no_decoder`, `failed` (see `error`).
 
 The worker defers while the client is writing `iq/current.raw*` and runs at
 `Nice=19`, idle I/O, low CPU weight.
+
+### IQ retention
+
+The `.sigmf-data` files are the only big thing (about 4 bytes per sample,
+50–230 MB per pass). Retention deletes them by outcome and age; metadata,
+database rows and frames are kept forever.
+
+| Outcome | Setting | Default |
+|---|---|---|
+| decoded | `iq_days` | 14 days |
+| empty (no bursts) | `empty_days` | 1 day |
+| bursts but no frames (`no_decoder`, `no_frames`, `failed`) | `undecoded_days` | 60 days |
+
+Age counts from the observation start. Overrides per satellite in
+`worker.yml` (`retention: { iq_days: forever }`); `touch iq/<obs>.keep` pins a
+single pass; queued (unprocessed) passes are never touched. Deleted passes get
+`satnogs:iq_deleted` in their metadata and `iq_deleted_utc` in the database.
+
+`satnogs-worker retention` lists what is expired (dry run); `--apply` deletes.
+Automatic deletion at the end of each `run` is off until `retention_auto: true`
+is set in `worker.yml`. `status` shows archive size, free space and what has
+expired.
 
 ### SQLite tables
 

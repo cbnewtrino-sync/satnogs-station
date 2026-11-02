@@ -14,7 +14,12 @@ defaults:
   decoder: auto
   parser: none
   always_decode: false
-  retention: { iq_days: 14, empty_days: 1, frames: forever }   # applied by the retention job (not yet built)
+  # IQ (.sigmf-data) retention in days after the observation, by outcome; "forever" keeps.
+  # Metadata, database rows and frames are never deleted; iq/<obs>.keep pins a pass.
+  # undecoded = bursts but no frames (no_decoder / no_frames / failed): kept longer so a
+  # pass can be decoded once its satellite is identified or a decoder is written.
+  # Per satellite: e.g.  41789: { ..., retention: { iq_days: 60 } }
+  retention: { iq_days: 14, empty_days: 1, undecoded_days: 60 }
 
 satellites:
   98492: { decoder: satyaml/SPIRONE.yml, parser: "satnogs:Spirone" }
@@ -33,3 +38,4 @@ settings:
   clock_min_db: 8.0          # symbol-clock line needed to measure a satellite's baud
   baud_search_frac: 0.02     # +-2 % around nominal baud
   baud_flag_ppm: 1000        # warn above this baud offset
+  retention_auto: false      # true: each `run` deletes expired IQ. Check `satnogs-worker retention` first

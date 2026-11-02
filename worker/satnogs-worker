@@ -47,7 +47,7 @@ try:
 except ImportError:          # config is optional; defaults work without it
     yaml = None
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 DEFAULT_BASE = "/var/lib/docker-bindmounts/satnogs_satnogs-client/opt/satnogs-non-free/local"
 
 DEFAULTS = {
@@ -55,7 +55,11 @@ DEFAULTS = {
     "parser": "none",           # none | satnogs:<Class> | path/to/parser.py[:Class] | path/to.ksy
     "always_decode": False,     # decode even when no bursts were detected
     "sample_rate": None,        # force a rate (skip measurement)
-    "retention": {"iq_days": 14, "empty_days": 1, "frames": "forever"},
+    # IQ (.sigmf-data) retention by outcome, days after the observation; "forever"
+    # keeps. Metadata, database rows and frames are never deleted. iq/<obs>.keep
+    # pins a pass. Passes with bursts but no frames are kept longer so they can be
+    # decoded once the satellite is identified / a decoder exists.
+    "retention": {"iq_days": 14, "empty_days": 1, "undecoded_days": 60},
 }
 SETTINGS = {
     "gr_satellites": "gr_satellites",
@@ -77,6 +81,7 @@ SETTINGS = {
     "carrier_max_dev": 0.2,         # reject a BPSK carrier further than this x baud from the centroid
     "decode_margin_s": 0.15,
     "decode_runs": 4,
+    "retention_auto": False,        # true: `run` deletes expired IQ (see `retention`)
     "fsk_deviation_sweep": [5000, 3000, 2400, 2000, 1500],   # Hz; one gr-satellites run each
     "min_frame_len": 8,             # shorter frames are suspect               # max gr-satellites runs per transmitter (union of frames)        # padding around bursts when re-centring / blanking
     "max_bursts_for_rate": 40,
@@ -694,7 +699,8 @@ CREATE INDEX IF NOT EXISTS frames_norad ON frames (norad_id, start_utc);
 # columns added after 0.1.0 (ALTERed into existing databases)
 NEW_COLUMNS = {
     "observations": {"measured_baud": "REAL", "baud_ppm": "REAL", "baud_source": "TEXT",
-                     "decode_rate": "REAL", "n_bursts_other": "INTEGER", "n_frames_other": "INTEGER"},
+                     "decode_rate": "REAL", "n_bursts_other": "INTEGER", "n_frames_other": "INTEGER",
+                     "iq_deleted_utc": "TEXT"},
     "bursts": {"transmitter": "INTEGER", "carrier_hz": "REAL", "carrier_db": "REAL"},  # 0 = scheduled
     "frames": {"transmitter": "INTEGER", "valid": "INTEGER DEFAULT 1"},   # valid 0 = suspect
 }
@@ -744,6 +750,12 @@ class Ctx:
         c.update(self.sats.get(norad, {}))
         return c
 
+    def retention(self, norad):
+        r = dict(DEFAULTS["retention"])
+        r.update(self.defaults.get("retention") or {})
+        r.update(self.sats.get(norad, {}).get("retention") or {})
+        return r
+
     def parser(self, spec):
         if spec not in self._parsers:
             try:
@@ -759,6 +771,9 @@ def process(ctx, obs_id):
     data_path = os.path.join(ctx.iq_dir, f"{obs_id}.sigmf-data")
     meta = json.load(open(meta_path))
     g = meta["global"]
+    if not os.path.exists(data_path) and g.get("satnogs:iq_deleted"):
+        raise FileNotFoundError(f"IQ deleted by retention on {g['satnogs:iq_deleted']}; "
+                                f"results from the last processing are kept")
     cap = meta["captures"][0]
     norad, baud = g.get("satnogs:norad_id"), g.get("satnogs:baud") or 0
     flow = g.get("satnogs:flowgraph") or "?"
@@ -1160,7 +1175,101 @@ def cmd_run(ctx, args, ids=None):
         q = os.path.join(ctx.queue_dir, str(obs))
         if os.path.exists(q):
             os.unlink(q)
+    if queued and ctx.settings["retention_auto"]:
+        expired, _ = retention_plan(ctx)
+        if expired:
+            apply_retention(ctx, expired)
     return rc
+
+
+# ----------------------------------------------------------------------------
+# Retention
+# ----------------------------------------------------------------------------
+RET_CLASS = {"decoded": "iq_days", "empty": "empty_days",
+             "no_frames": "undecoded_days", "no_decoder": "undecoded_days", "failed": "undecoded_days"}
+
+
+def parse_utc(s):
+    try:
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def retention_plan(ctx, now=None):
+    """-> (expired, kept_reasons). expired: (obs, path, bytes, status, age_days, limit_days)."""
+    now = now or datetime.now(timezone.utc)
+    expired, held = [], {}
+    for path in sorted(glob.glob(os.path.join(ctx.iq_dir, "*.sigmf-data"))):
+        name = os.path.basename(path).split(".")[0]
+        if not name.isdigit():
+            continue
+        obs = int(name)
+        if os.path.exists(os.path.join(ctx.queue_dir, name)):
+            held["queued"] = held.get("queued", 0) + 1
+            continue
+        if os.path.exists(os.path.join(ctx.iq_dir, f"{name}.keep")):
+            held[".keep"] = held.get(".keep", 0) + 1
+            continue
+        row = ctx.db.execute("SELECT norad_id, status, start_utc FROM observations WHERE obs_id=?",
+                             (obs,)).fetchone()
+        if not row or row[1] not in RET_CLASS:
+            held["not processed"] = held.get("not processed", 0) + 1
+            continue
+        norad, status, start = row
+        limit = ctx.retention(norad).get(RET_CLASS[status])
+        if limit is None or str(limit).strip().lower() in ("forever", "never", ""):
+            held["kept forever"] = held.get("kept forever", 0) + 1
+            continue
+        t = parse_utc(start) or datetime.fromtimestamp(os.path.getmtime(path), timezone.utc)
+        age = (now - t).total_seconds() / 86400
+        if age >= float(limit):
+            expired.append((obs, path, os.path.getsize(path), status, age, float(limit)))
+        else:
+            held["within limit"] = held.get("within limit", 0) + 1
+    return expired, held
+
+
+def apply_retention(ctx, expired):
+    freed = 0
+    for obs, path, size, status, age, limit in expired:
+        try:
+            os.unlink(path)
+        except OSError as e:
+            log.error("retention: obs %s: %s", obs, e)
+            continue
+        freed += size
+        stamp = now_utc()
+        meta_path = os.path.join(ctx.iq_dir, f"{obs}.sigmf-meta")
+        try:                      # metadata stays; note that its data file is gone
+            meta = json.load(open(meta_path))
+            meta["global"]["satnogs:iq_deleted"] = stamp
+            tmp = meta_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(meta, f, indent=2)
+            os.replace(tmp, meta_path)
+        except (OSError, ValueError, KeyError) as e:
+            log.warning("retention: obs %s metadata not updated: %s", obs, e)
+        with ctx.db:
+            ctx.db.execute("UPDATE observations SET iq_deleted_utc=? WHERE obs_id=?", (stamp, obs))
+        log.info("retention: deleted IQ of obs %s (%s, %.1f days old, limit %g) %.0f MB",
+                 obs, status, age, limit, size / 1e6)
+    return freed
+
+
+def cmd_retention(ctx, args):
+    expired, held = retention_plan(ctx)
+    total = sum(e[2] for e in expired)
+    for obs, path, size, status, age, limit in expired:
+        print(f"  {obs:>9}  {status:<10}  {age:6.1f} d old (limit {limit:g})  {size / 1e6:7.0f} MB")
+    print(f"{len(expired)} expired IQ file(s), {total / 1e9:.2f} GB" +
+          ("" if not held else "; kept: " + ", ".join(f"{v} {k}" for k, v in sorted(held.items()))))
+    if not args.apply:
+        print("dry run -- `satnogs-worker retention --apply` deletes them")
+        return 0
+    freed = apply_retention(ctx, expired)
+    print(f"deleted, {freed / 1e9:.2f} GB freed")
+    return 0
 
 
 def cmd_status(ctx, _args):
@@ -1181,6 +1290,13 @@ def cmd_status(ctx, _args):
         print(f"  {r[0]:>9} {str(r[1])[:14]:<14} {(r[2] or '')[:16]:<16} bursts {f'{r[3] or 0}{ob}':>6} "
               f"frames {f'{r[4] or 0}{of}':>6} rate {rate} {r[6] or '':<9} baud {bd} snr {snr} {r[8]}")
     print("  (+N = bursts/frames from other transmitters sharing the channel)")
+    files = glob.glob(os.path.join(ctx.iq_dir, "*.sigmf-data"))
+    used = sum(os.path.getsize(f) for f in files)
+    expired, _ = retention_plan(ctx)
+    st = os.statvfs(ctx.iq_dir)
+    print(f"IQ archive: {len(files)} files, {used / 1e9:.2f} GB; {st.f_bavail * st.f_frsize / 1e9:.1f} GB free; "
+          f"retention: {len(expired)} expired ({sum(e[2] for e in expired) / 1e9:.2f} GB), "
+          f"auto-delete {'on' if ctx.settings['retention_auto'] else 'off'}")
     # Same offset on every satellite of a flowgraph => station rate rule is wrong;
     # offset on one satellite only => that satellite's oscillator.
     print("flowgraph check (median baud offset per satellite):")
@@ -1241,6 +1357,8 @@ def main():
     rp = sub.add_parser("reprocess")
     rp.add_argument("ids", nargs="+", type=int)
     sub.add_parser("status")
+    rp2 = sub.add_parser("retention", help="list (or --apply: delete) expired IQ files")
+    rp2.add_argument("--apply", action="store_true")
     fp = sub.add_parser("frames", help="print decoded frames and telemetry")
     fp.add_argument("ids", nargs="+", type=int)
     fp.add_argument("--all", action="store_true", help="include suspect frames")
@@ -1258,6 +1376,8 @@ def main():
         return cmd_status(ctx, args)
     if args.cmd == "frames":
         return cmd_frames(ctx, args)
+    if args.cmd == "retention":
+        return cmd_retention(ctx, args)
     if args.cmd == "reprocess":
         args.max = len(args.ids)
         return cmd_run(ctx, args, ids=args.ids)
