@@ -117,6 +117,25 @@ Statuses: `decoded`, `no_frames`, `empty`, `no_decoder`, `failed` (see `error`).
 The worker defers while the client is writing `iq/current.raw*` and runs at
 `Nice=19`, idle I/O, low CPU weight.
 
+### Other users' observations
+
+With the station "available", other SatNOGS users can schedule it. The client
+uploads their results to SatNOGS as usual — the post script only archives the
+IQ dump — but the worker shouldn't spend time and disk on them. The client's
+job data doesn't say who scheduled a pass, so before processing, the worker
+asks the Network API (`/api/observations/<id>/`, field `observer`) and caches
+the answer in the `observers` table.
+
+- `own_observers: [NewtMan]` — passes by these users are processed; `[]` turns
+  the filter off
+- `others: delete | keep | process` — delete removes the IQ and metadata;
+  keep leaves them unprocessed (expire after `other_days`); either way the pass
+  gets an `observations` row with status `other_observer` and the observer
+- API unreachable: the pass stays queued and is retried each run; after
+  `observer_retry_hours` (24) it is processed as our own (nothing is deleted
+  on a guess)
+- `satnogs-worker reprocess <id>` always processes, whoever scheduled it
+
 ### CW beacons
 
 Passes scheduled as CW (`satnogs_cw_decoder.py`, or `mode: cw` per satellite in

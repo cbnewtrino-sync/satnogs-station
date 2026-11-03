@@ -38,6 +38,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 
 import numpy as np
@@ -47,7 +49,7 @@ try:
 except ImportError:          # config is optional; defaults work without it
     yaml = None
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 DEFAULT_BASE = "/var/lib/docker-bindmounts/satnogs_satnogs-client/opt/satnogs-non-free/local"
 
 DEFAULTS = {
@@ -59,7 +61,7 @@ DEFAULTS = {
     # keeps. Metadata, database rows and frames are never deleted. iq/<obs>.keep
     # pins a pass. Passes with bursts but no frames are kept longer so they can be
     # decoded once the satellite is identified / a decoder exists.
-    "retention": {"iq_days": 14, "empty_days": 1, "undecoded_days": 60},
+    "retention": {"iq_days": 14, "empty_days": 1, "undecoded_days": 60, "other_days": 7},
 }
 SETTINGS = {
     "gr_satellites": "gr_satellites",
@@ -88,7 +90,14 @@ SETTINGS = {
     "cw_min_chars": 4,              # CW: shorter decoded text is flagged suspect
     "cw_max_unknown": 0.25,         # CW: ... as is text with more than this fraction of '*'
     "cw_bw_hz": 100,                # CW: first-pass filter +-Hz (second pass matches the keying speed)
-    "retention_auto": False,        # true: `run` deletes expired IQ (see `retention`)
+    "retention_auto": False,
+    # Observations scheduled by other SatNOGS users (station "available"): the
+    # observer comes from the Network API (the client's job data doesn't carry it).
+    "own_observers": [],            # usernames whose passes are processed; [] = all (filter off)
+    "others": "keep",               # other users' passes: delete (IQ + meta) | keep (unprocessed) | process
+    "network_api": "https://network.satnogs.org/api/observations/{id}/",
+    "api_timeout_s": 15,
+    "observer_retry_hours": 24,     # API unreachable this long after the pass: process it as our own        # true: `run` deletes expired IQ (see `retention`)
     "fsk_deviation_sweep": [5000, 3000, 2400, 2000, 1500],   # Hz; one gr-satellites run each
     "min_frame_len": 8,             # shorter frames are suspect               # max gr-satellites runs per transmitter (union of frames)        # padding around bursts when re-centring / blanking
     "max_bursts_for_rate": 40,
@@ -872,6 +881,8 @@ CREATE TABLE IF NOT EXISTS frames (
   idx INTEGER, length INTEGER, data BLOB, sha1 TEXT, UNIQUE (obs_id, sha1));
 CREATE TABLE IF NOT EXISTS telemetry (
   frame_id INTEGER PRIMARY KEY, parser TEXT, fields TEXT, error TEXT);
+CREATE TABLE IF NOT EXISTS observers (
+  obs_id INTEGER PRIMARY KEY, observer TEXT, station TEXT, looked_up_utc TEXT);
 CREATE TABLE IF NOT EXISTS transmitters (
   obs_id INTEGER, idx INTEGER, n_bursts INTEGER, offset_hz REAL, measured_baud REAL,
   baud_ppm REAL, clock_line_db REAL, baud_source TEXT, n_frames INTEGER,
@@ -883,7 +894,7 @@ CREATE INDEX IF NOT EXISTS frames_norad ON frames (norad_id, start_utc);
 NEW_COLUMNS = {
     "observations": {"measured_baud": "REAL", "baud_ppm": "REAL", "baud_source": "TEXT",
                      "decode_rate": "REAL", "n_bursts_other": "INTEGER", "n_frames_other": "INTEGER",
-                     "iq_deleted_utc": "TEXT"},
+                     "iq_deleted_utc": "TEXT", "observer": "TEXT"},
     "bursts": {"transmitter": "INTEGER", "carrier_hz": "REAL", "carrier_db": "REAL"},  # 0 = scheduled
     "frames": {"transmitter": "INTEGER", "valid": "INTEGER DEFAULT 1"},   # valid 0 = suspect
 }
@@ -1368,6 +1379,78 @@ def client_busy(ctx):
     return None
 
 
+# ----------------------------------------------------------------------------
+# Observer filter
+# ----------------------------------------------------------------------------
+def lookup_observer(ctx, obs):
+    """SatNOGS username that scheduled obs (cached), or None if not available yet."""
+    row = ctx.db.execute("SELECT observer FROM observers WHERE obs_id=?", (obs,)).fetchone()
+    if row and row[0]:
+        return row[0]
+    url = ctx.settings["network_api"].format(id=obs)
+    req = urllib.request.Request(url, headers={"User-Agent": f"satnogs-worker/{VERSION}",
+                                               "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=ctx.settings["api_timeout_s"]) as r:
+            d = json.load(r)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        log.warning("obs %s: observer lookup failed: %s", obs, e)
+        return None
+    if isinstance(d, list):
+        d = d[0] if d else {}
+    who = d.get("observer") if isinstance(d, dict) else None
+    if not who:
+        log.warning("obs %s: Network API record has no observer", obs)
+        return None
+    with ctx.db:
+        ctx.db.execute("INSERT OR REPLACE INTO observers VALUES (?,?,?,?)",
+                       (obs, who, d.get("station_name"), now_utc()))
+    return who
+
+
+def obs_age_hours(ctx, obs):
+    meta = os.path.join(ctx.iq_dir, f"{obs}.sigmf-meta")
+    try:
+        t = parse_utc(json.load(open(meta))["captures"][0].get("core:datetime"))
+    except (OSError, ValueError, KeyError, IndexError):
+        t = None
+    if t is None:
+        try:
+            t = datetime.fromtimestamp(os.path.getmtime(meta), timezone.utc)
+        except OSError:
+            return None
+    return (datetime.now(timezone.utc) - t).total_seconds() / 3600
+
+
+def handle_other(ctx, obs, who, policy):
+    """Another user's pass: record it, then delete or keep the IQ unprocessed."""
+    meta_path = os.path.join(ctx.iq_dir, f"{obs}.sigmf-meta")
+    data_path = os.path.join(ctx.iq_dir, f"{obs}.sigmf-data")
+    try:
+        meta = json.load(open(meta_path))
+        g, cap = meta["global"], meta["captures"][0]
+    except (OSError, ValueError, KeyError, IndexError):
+        g, cap = {}, {}
+    deleted = None
+    if policy == "delete":
+        for p in (data_path, meta_path):
+            if os.path.exists(p):
+                os.unlink(p)
+        deleted = now_utc()
+    row = {"obs_id": obs, "norad_id": g.get("satnogs:norad_id"), "satellite": g.get("satnogs:satellite_name"),
+           "start_utc": cap.get("core:datetime"), "freq_hz": cap.get("core:frequency"),
+           "baud": g.get("satnogs:baud"), "flowgraph": g.get("satnogs:flowgraph"),
+           "status": "other_observer", "error": None, "observer": who, "processed_utc": now_utc(),
+           "worker_version": VERSION, "data_path": data_path, "iq_deleted_utc": deleted}
+    with ctx.db:
+        for tbl in ("frames", "bursts", "transmitters"):
+            ctx.db.execute(f"DELETE FROM {tbl} WHERE obs_id=?", (obs,))
+        ctx.db.execute(f"INSERT OR REPLACE INTO observations ({','.join(row)}) "
+                       f"VALUES ({','.join('?' * len(row))})", list(row.values()))
+    log.info("obs %s: scheduled by %s, not us -> %s", obs, who,
+             "IQ and metadata deleted" if deleted else "kept unprocessed")
+
+
 def cmd_run(ctx, args, ids=None):
     lock = open(os.path.join(ctx.base, ".worker.lock"), "w")
     try:
@@ -1379,13 +1462,32 @@ def cmd_run(ctx, args, ids=None):
     if queued:
         ids = sorted((int(n) for n in os.listdir(ctx.queue_dir) if n.isdigit()), key=int)[: args.max]
     rc = 0
+    S = ctx.settings
+    own = [str(o).lower() for o in (S["own_observers"] or [])]
     for obs in ids:
         busy = client_busy(ctx)
         if busy:
             log.info("observation in progress (%s), deferring", os.path.basename(busy))
             break
+        who = lookup_observer(ctx, obs) if own else None
+        if own and who is None:
+            age = obs_age_hours(ctx, obs)
+            if queued and age is not None and age < S["observer_retry_hours"]:
+                log.info("obs %s: observer not known yet, leaving queued", obs)
+                continue
+            if queued:
+                log.warning("obs %s: observer still unknown after %.0f h; processing as our own", obs, age or 0)
+        if queued and who and who.lower() not in own and S["others"] != "process":
+            handle_other(ctx, obs, who, S["others"])
+            q = os.path.join(ctx.queue_dir, str(obs))
+            if os.path.exists(q):
+                os.unlink(q)
+            continue
         try:
             process(ctx, obs)
+            if who:
+                with ctx.db:
+                    ctx.db.execute("UPDATE observations SET observer=? WHERE obs_id=?", (who, obs))
         except FileNotFoundError as e:
             log.error("obs %s: %s", obs, e)
             rc = 1
@@ -1411,7 +1513,7 @@ def cmd_run(ctx, args, ids=None):
 # ----------------------------------------------------------------------------
 # Retention
 # ----------------------------------------------------------------------------
-RET_CLASS = {"decoded": "iq_days", "empty": "empty_days",
+RET_CLASS = {"decoded": "iq_days", "empty": "empty_days", "other_observer": "other_days",
              "no_frames": "undecoded_days", "no_decoder": "undecoded_days", "failed": "undecoded_days"}
 
 
@@ -1502,7 +1604,7 @@ def cmd_status(ctx, _args):
     q = sorted(n for n in os.listdir(ctx.queue_dir) if n.isdigit()) if os.path.isdir(ctx.queue_dir) else []
     print(f"queued: {len(q)} {' '.join(q[:10])}")
     for r in ctx.db.execute("SELECT status, COUNT(*) FROM observations GROUP BY status"):
-        print(f"  {r[0]:<11} {r[1]}")
+        print(f"  {r[0]:<15} {r[1]}")
     print("recent:")
     for r in ctx.db.execute("SELECT obs_id, satellite, start_utc, n_bursts, n_frames, sample_rate, "
                             "rate_status, best_snr_db, status, measured_baud, baud_ppm, "

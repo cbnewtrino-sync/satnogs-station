@@ -19,7 +19,7 @@ defaults:
   # undecoded = bursts but no frames (no_decoder / no_frames / failed): kept longer so a
   # pass can be decoded once its satellite is identified or a decoder is written.
   # Per satellite: e.g.  41789: { ..., retention: { iq_days: 60 } }
-  retention: { iq_days: 14, empty_days: 1, undecoded_days: 60 }
+  retention: { iq_days: 14, empty_days: 1, undecoded_days: 60, other_days: 7 }
 
 satellites:
   98492: { decoder: satyaml/SPIRONE.yml, parser: "satnogs:Spirone" }
@@ -39,3 +39,9 @@ settings:
   baud_search_frac: 0.02     # +-2 % around nominal baud
   baud_flag_ppm: 1000        # warn above this baud offset
   retention_auto: false      # true: each `run` deletes expired IQ. Check `satnogs-worker retention` first
+  # Passes scheduled by other SatNOGS users (once the station is "available"): looked up
+  # in the Network API before processing. delete = remove IQ + metadata (the client has
+  # already uploaded everything to SatNOGS); keep = leave unprocessed (other_days
+  # retention); process = treat like our own. [] turns the filter off.
+  own_observers: [NewtMan]
+  others: delete
