@@ -93,9 +93,41 @@ def bpsk(bits, rate, baud, alpha=0.35, f_off=0.0, span=6):
     return y * np.exp(1j * (2 * np.pi * f_off * np.arange(n) / rate + 0.7))
 
 
+MORSE_TX = {"A": ".-", "B": "-...", "C": "-.-.", "D": "-..", "E": ".", "F": "..-.", "G": "--.", "H": "....",
+            "I": "..", "J": ".---", "K": "-.-", "L": ".-..", "M": "--", "N": "-.", "O": "---", "P": ".--.",
+            "Q": "--.-", "R": ".-.", "S": "...", "T": "-", "U": "..-", "V": "...-", "W": ".--", "X": "-..-",
+            "Y": "-.--", "Z": "--..", "0": "-----", "1": ".----", "2": "..---", "3": "...--", "4": "....-",
+            "5": ".....", "6": "-....", "7": "--...", "8": "---..", "9": "----.", "/": "-..-.", "=": "-...-"}
+
+
+def cw(text, rate, wpm, f_off=0.0, drift_hz_s=0.0, t0=0.0, rise_s=0.005):
+    """Keyed carrier for text (PARIS timing), raised-cosine edges, linear drift."""
+    dit = 1.2 / wpm
+    key = []
+    for w, word in enumerate(text.split()):
+        if w:
+            key += [0] * 4                      # 7-dit word gap (3 already added after char)
+        for ch in word:
+            for j, el in enumerate(MORSE_TX[ch]):
+                if j:
+                    key += [0]
+                key += [1] * (1 if el == "." else 3)
+            key += [0] * 3
+    n_dit = int(round(dit * rate))
+    k = np.repeat(np.array(key, float), n_dit)
+    r = max(1, int(rise_s * rate))
+    k = np.convolve(k, np.hanning(2 * r) / np.hanning(2 * r).sum(), mode="same")
+    t = np.arange(len(k)) / rate
+    f = f_off + drift_hz_s * (t0 + t)
+    return k * np.exp(1j * 2 * np.pi * np.cumsum(f) / rate)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mod", choices=["gmsk", "bpsk"], default="gmsk")
+    ap.add_argument("--mod", choices=["gmsk", "bpsk", "cw"], default="gmsk")
+    ap.add_argument("--wpm", type=float, default=20)
+    ap.add_argument("--drift-hz-s", type=float, default=0.0, help="carrier drift (cw)")
+    ap.add_argument("--snr-bw", type=float, help="bandwidth the SNR refers to (default 2*baud; cw 500 Hz)")
     ap.add_argument("dir")
     ap.add_argument("obs", type=int)
     ap.add_argument("--rate", type=float, default=57600.0)
@@ -117,21 +149,26 @@ def main():
     np.random.seed(a.seed)
 
     n = int(a.seconds * a.rate)
-    noise_bw = 2 * a.baud                      # define SNR in +-baud
+    noise_bw = a.snr_bw or (500.0 if a.mod == "cw" else 2 * a.baud)   # bandwidth the SNR refers to
     sigma = np.sqrt(0.5 * a.rate / noise_bw)   # unit-power signal => SNR 0 dB in noise_bw
     x = (np.random.randn(n) + 1j * np.random.randn(n)) * sigma
     truth = []
     if not a.empty:
         t, k = a.start, 0
         while t < a.seconds - 2:
-            info = (f"burst {k} ".encode() + bytes(range(256)))[: (160 if k % 2 == 0 else 54)]
-            fr = ax25_frame(info)
-            mod = bpsk if a.mod == "bpsk" else gmsk
-            s = mod(frame_bits(fr), a.rate, a.true_baud or a.baud, f_off=a.offset_hz)
+            if a.mod == "cw":
+                txt = f"VVV DE TEST {k:03d} T{np.random.randint(10, 99)} V{np.random.randint(100, 999)} K"
+                s = cw(txt, a.rate, a.wpm, a.offset_hz, a.drift_hz_s, t)
+                fr = txt.encode()
+            else:
+                info = (f"burst {k} ".encode() + bytes(range(256)))[: (160 if k % 2 == 0 else 54)]
+                fr = ax25_frame(info)
+                mod = bpsk if a.mod == "bpsk" else gmsk
+                s = mod(frame_bits(fr), a.rate, a.true_baud or a.baud, f_off=a.offset_hz)
             snr = a.snr_db[k % len(a.snr_db)]
             i0 = int(t * a.rate)
             x[i0:i0 + len(s)] += s[: n - i0] * 10 ** (snr / 20)
-            truth.append({"t": t, "len": len(fr), "snr_db": snr})
+            truth.append({"t": t, "len": len(fr), "snr_db": snr, **({"text": fr.decode()} if a.mod == "cw" else {})})
             t += a.period
             k += 1
     if a.interferer and not a.empty:

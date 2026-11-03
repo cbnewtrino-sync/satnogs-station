@@ -117,6 +117,28 @@ Statuses: `decoded`, `no_frames`, `empty`, `no_decoder`, `failed` (see `error`).
 The worker defers while the client is writing `iq/current.raw*` and runs at
 `Nice=19`, idle I/O, low CPU weight.
 
+### CW beacons
+
+Passes scheduled as CW (`satnogs_cw_decoder.py`, or `mode: cw` per satellite in
+`worker.yml`) skip burst-level baud/carrier analysis and gr-satellites (which
+has no CW) and use the worker's own Morse decoder:
+
+1. carrier found and tracked in 0.1 s / 10 Hz spectrogram frames (follows
+   residual Doppler drift); transmissions = key-down activity with gaps
+   < 1.5 s
+2. envelope in a ±100 Hz filter → adaptive mark/space threshold (local
+   10th/90th percentiles, so fading doesn't lose weak parts) → keying speed
+3. one speed for the whole pass (SatNOGS's baud value as a hint if 5–60, else
+   the median of the stronger transmissions); second pass with a filter
+   matched to that speed (about ±25 Hz at 20 WPM)
+4. dit/dah and gap classification → text (`*` = unrecognised character)
+
+Each transmission is a burst; its text is a frame (telemetry: text, WPM,
+carrier offset, SNR, time) and the SigMF annotation's `core:comment`. Text
+under 4 characters or more than 25 % `*` is flagged suspect. Synthetic tests:
+clean copy down to about 2 dB SNR (in 500 Hz), mostly readable at 0 to −2 dB.
+CW keyed within a pass scheduled for another mode is not decoded.
+
 ### IQ retention
 
 The `.sigmf-data` files are the only big thing (about 4 bytes per sample,
