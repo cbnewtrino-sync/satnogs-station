@@ -29,6 +29,7 @@ import glob
 import hashlib
 import importlib.util
 import json
+import math
 import logging
 import os
 import re
@@ -40,7 +41,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
@@ -49,7 +50,7 @@ try:
 except ImportError:          # config is optional; defaults work without it
     yaml = None
 
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 DEFAULT_BASE = "/var/lib/docker-bindmounts/satnogs_satnogs-client/opt/satnogs-non-free/local"
 
 DEFAULTS = {
@@ -852,6 +853,10 @@ def load_parser(spec, cfgdir, cache_dir):
     spec_ = importlib.util.spec_from_file_location(f"parser_{abs(hash(path))}", path)
     m = importlib.util.module_from_spec(spec_)
     spec_.loader.exec_module(m)
+    # plain Python parser: a function parse(data: bytes) -> dict (or the named one)
+    f = getattr(m, clsname or "parse", None)
+    if callable(f) and not isinstance(f, type):
+        return spec, f
     if clsname:
         cls = getattr(m, clsname)
     else:
@@ -860,6 +865,72 @@ def load_parser(spec, cfgdir, cache_dir):
                    if isinstance(v, type) and issubclass(v, KaitaiStruct) and v is not KaitaiStruct
                    and v.__module__ == m.__name__)
     return spec, lambda b: kaitai_dict(cls.from_bytes(b))
+
+
+# ----------------------------------------------------------------------------
+# Decommutation: frame -> telemetry fields (parser) -> points (calibration)
+# ----------------------------------------------------------------------------
+CW_KEYS = ("text", "wpm", "freq_hz", "snr_db", "t_offset_s")
+
+
+def calibrate_value(c, x):
+    try:
+        if "poly" in c:
+            return float(sum(a * x ** i for i, a in enumerate(c["poly"])))
+        if "expr" in c:
+            env = {k: getattr(math, k) for k in dir(math) if not k.startswith("_")}
+            return float(eval(c["expr"], {"__builtins__": {}}, {**env, "x": x}))
+        return float(x)                                   # unit/description only
+    except Exception:
+        return None
+
+
+def decom(ctx, sc, data, cw_meta=None):
+    """-> (parser_name, fields dict, error, points [(name, raw, value, unit)])."""
+    fields, err, names = {}, None, []
+    if cw_meta is not None:
+        fields.update(cw_meta)
+        names.append("cw")
+    pname, pfn = ctx.parser(sc.get("parser", "none"))
+    parsed = {}
+    if pfn:
+        names.append(pname)
+        try:
+            parsed = jsonable(pfn(data)) or {}
+            if not isinstance(parsed, dict):
+                parsed = {"value": parsed}
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"[:300]
+        fields.update(parsed)
+    elif pname:
+        names.append(pname)
+        err = "parser unavailable"
+    cal = ctx.calib(sc.get("calib"))
+    pts = []
+    if cal is not None:                                   # calibrated fields only, with units
+        for name, c in cal.items():
+            x = parsed.get(name)
+            if isinstance(x, (int, float)) and not isinstance(x, bool):
+                pts.append((name, x, calibrate_value(c or {}, x), (c or {}).get("unit")))
+    else:                                                 # no calibration: numeric fields as raw counts
+        for name, x in parsed.items():
+            if isinstance(x, (int, float)) and not isinstance(x, bool):
+                pts.append((name, x, float(x), None))
+    return "+".join(names) or None, (fields if names else None), err, pts
+
+
+def store_decom(ctx, db, sc, frame_id, obs_id, norad, start, t_offset, data, cw_meta, valid):
+    pname, fields, err, pts = decom(ctx, sc, data, cw_meta)
+    if pname:
+        db.execute("INSERT OR REPLACE INTO telemetry VALUES (?,?,?,?)",
+                   (frame_id, pname, json.dumps(fields) if fields is not None else None, err))
+    if not valid or not pts:
+        return 0
+    t = parse_utc(start)
+    tstr = (t + timedelta(seconds=t_offset or 0)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")[:-4] + "Z" if t else start
+    db.executemany("INSERT INTO points VALUES (?,?,?,?,?,?,?,?)",
+                   [(obs_id, frame_id, norad, tstr, n, raw, v, u) for n, raw, v, u in pts])
+    return len(pts)
 
 
 # ----------------------------------------------------------------------------
@@ -881,6 +952,11 @@ CREATE TABLE IF NOT EXISTS frames (
   idx INTEGER, length INTEGER, data BLOB, sha1 TEXT, UNIQUE (obs_id, sha1));
 CREATE TABLE IF NOT EXISTS telemetry (
   frame_id INTEGER PRIMARY KEY, parser TEXT, fields TEXT, error TEXT);
+CREATE TABLE IF NOT EXISTS points (
+  obs_id INTEGER, frame_id INTEGER, norad_id INTEGER, time_utc TEXT,
+  name TEXT, raw REAL, value REAL, unit TEXT);
+CREATE INDEX IF NOT EXISTS points_series ON points (norad_id, name, time_utc);
+CREATE INDEX IF NOT EXISTS points_frame ON points (frame_id);
 CREATE TABLE IF NOT EXISTS observers (
   obs_id INTEGER PRIMARY KEY, observer TEXT, station TEXT, looked_up_utc TEXT);
 CREATE TABLE IF NOT EXISTS transmitters (
@@ -896,7 +972,7 @@ NEW_COLUMNS = {
                      "decode_rate": "REAL", "n_bursts_other": "INTEGER", "n_frames_other": "INTEGER",
                      "iq_deleted_utc": "TEXT", "observer": "TEXT"},
     "bursts": {"transmitter": "INTEGER", "carrier_hz": "REAL", "carrier_db": "REAL"},  # 0 = scheduled
-    "frames": {"transmitter": "INTEGER", "valid": "INTEGER DEFAULT 1"},   # valid 0 = suspect
+    "frames": {"transmitter": "INTEGER", "valid": "INTEGER DEFAULT 1", "t_offset_s": "REAL"},   # valid 0 = suspect
 }
 
 
@@ -939,6 +1015,7 @@ class Ctx:
         self.db = db_open(db_path)
         self._parsers = {}
         self.mode_override = None
+        self._calibs = {}
 
     def satcfg(self, norad):
         c = dict(self.defaults)
@@ -950,6 +1027,19 @@ class Ctx:
         r.update(self.defaults.get("retention") or {})
         r.update(self.sats.get(norad, {}).get("retention") or {})
         return r
+
+    def calib(self, spec):
+        """Calibration file -> {field: {poly|expr, unit, desc}} or None."""
+        if not spec:
+            return None
+        if spec not in self._calibs:
+            path = spec if os.path.isabs(spec) else os.path.join(self.cfgdir, spec)
+            try:
+                self._calibs[spec] = (yaml.safe_load(open(path)) or {}).get("fields") or {}
+            except Exception as e:
+                log.error("calibration %s unavailable: %s", spec, e)
+                self._calibs[spec] = None
+        return self._calibs[spec]
 
     def parser(self, spec):
         if spec not in self._parsers:
@@ -1010,8 +1100,7 @@ def process(ctx, obs_id):
     is_cw = mode == "cw" or ("_cw" in flow and mode in ("", "auto"))
     if ctx.mode_override:
         log.info("  mode override: %s (scheduled flowgraph %s)", ctx.mode_override, flow)
-    cw_info = {}
-    if is_cw:
+    def run_cw():
         # --- CW beacon: own detector/decoder (gr-satellites has no CW). Bursts =
         # whole transmissions, frames = decoded text, telemetry = text/WPM/freq/SNR.
         # SatNOGS's baud for CW is used only as a keying-speed hint (5..60 WPM).
@@ -1021,15 +1110,14 @@ def process(ctx, obs_id):
                  "hi_hz": c["freq_hz"] + c["bw_hz"], "snr_db": c["snr_db"], "ebn0_db": None,
                  "carrier_hz": None, "carrier_db": None} for c in cw]
         tx_of = {i: 0 for i in range(len(cw))}
+        cw_info = [{"text": c["text"], "wpm": c["wpm"] and round(c["wpm"], 1), "freq_hz": round(c["freq_hz"], 1),
+                    "snr_db": c["snr_db"] and round(c["snr_db"], 1), "t_offset_s": round(c["a"] / rate, 2)}
+                   for c in cw if c["text"].strip()]
         texts = [c["text"].encode() for c in cw if c["text"].strip()]
         txs = [{"idx": list(range(len(cw))), "offset_hz": float(np.median([c["freq_hz"] for c in cw])),
                 "baud": None, "ppm": None, "prom": None, "baud_used": baud, "source": "n/a (CW)",
                 "frames": texts}] if cw else []
         for i, c in enumerate(cw):
-            cw_info.setdefault(c["text"].encode(), {"text": c["text"], "wpm": c["wpm"] and round(c["wpm"], 1),
-                                                    "freq_hz": round(c["freq_hz"], 1),
-                                                    "snr_db": c["snr_db"] and round(c["snr_db"], 1),
-                                                    "t_offset_s": round(c["a"] / rate, 2)})
             log.info("  CW %5.1f s +%4.1f s @ %+.0f Hz, %s WPM, SNR %s dB: %s", c["a"] / rate,
                      (c["b"] - c["a"]) / rate, c["freq_hz"], c["wpm"] and f"{c['wpm']:.0f}",
                      c["snr_db"] is not None and f"{c['snr_db']:.1f}", c["text"] or "(nothing decoded)")
@@ -1038,6 +1126,13 @@ def process(ctx, obs_id):
         decoder = sat_arg = "cw"
         error = None if rate else "sample rate unknown"
         status = "failed" if not rate else "empty" if not cw else "decoded" if texts else "no_frames"
+        return (bursts, meas, tx_of, txs, cw_info, measured_baud, ppm, prom, baud_used, baud_source,
+                decode_rate, decoder, sat_arg, error, status)
+
+    cw_info = []
+    if is_cw:
+        (bursts, meas, tx_of, txs, cw_info, measured_baud, ppm, prom, baud_used, baud_source,
+         decode_rate, decoder, sat_arg, error, status) = run_cw()
     else:
         # --- pass 2: band-limited detection at the true rate (10 ms blocks)
         bursts, meas, quiet_span = coarse, [{} for _ in coarse], None
@@ -1233,14 +1328,34 @@ def process(ctx, obs_id):
             else:
                 status = "decoded" if n_any else "no_frames"
 
+    # CW fallback (per satellite): many satellites beacon CW on the same frequency
+    # as their data transmitter, and the data mode is often silent (e.g. KOSEN-1:
+    # GMSK scheduled, only CW heard). If the data path found no frames, try CW.
+    if (not is_cw and sc.get("cw_fallback") and rate and not ctx.mode_override
+            and status in ("empty", "no_frames", "no_decoder", "failed")):
+        r = run_cw()
+        if r[-1] == "decoded":
+            log.info("  no data frames; CW fallback decoded %d message(s)", len(r[3][0]["frames"]))
+            (bursts, meas, tx_of, txs, cw_info, measured_baud, ppm, prom, baud_used, baud_source,
+             decode_rate, decoder, sat_arg, error, status) = r
+            is_cw, cw_fallback = True, True
+        else:
+            log.info("  no data frames; CW fallback found no CW either")
+            cw_fallback = False
+    else:
+        cw_fallback = False
+
     # unique frames (scheduled transmitter first), original order
+    # (CW: every transmission is a sample in time, so repeats are kept; their
+    # hash includes the time offset)
     seen, uniq = set(), []
     for ti, t in enumerate(txs):
-        for fr in t["frames"]:
-            h = hashlib.sha1(fr).hexdigest()
+        for k, fr in enumerate(t["frames"]):
+            cm = cw_info[k] if is_cw and ti == 0 and k < len(cw_info) else None
+            h = hashlib.sha1(fr + (f"@{cm['t_offset_s']}".encode() if cm else b"")).hexdigest()
             if h not in seen:
                 seen.add(h)
-                uniq.append((fr, h, ti))
+                uniq.append((fr, h, ti, cm))
     if is_cw:      # garbled copy: too short, or too many unresolved characters
         valid = [len(u[0].replace(b" ", b"")) >= S["cw_min_chars"] and
                  u[0].count(b"*") <= S["cw_max_unknown"] * len(u[0].replace(b" ", b"")) for u in uniq]
@@ -1258,7 +1373,6 @@ def process(ctx, obs_id):
     if status == "decoded" and not n_main + n_other:
         status = "no_frames"
 
-    pname, pfn = ("cw", None) if is_cw else ctx.parser(sc.get("parser", "none"))
     start = cap.get("core:datetime")
     dur = iq.n / rate if rate else None
     snrs = [meas[i]["snr_db"] for i in (txs[0]["idx"] if txs else []) if meas[i].get("snr_db") is not None]
@@ -1268,7 +1382,7 @@ def process(ctx, obs_id):
     with db:
         old = [r[0] for r in db.execute("SELECT frame_id FROM frames WHERE obs_id=?", (obs_id,))]
         db.executemany("DELETE FROM telemetry WHERE frame_id=?", [(i,) for i in old])
-        for tbl in ("frames", "bursts", "transmitters"):
+        for tbl in ("frames", "bursts", "transmitters", "points"):
             db.execute(f"DELETE FROM {tbl} WHERE obs_id=?", (obs_id,))
         row = {"obs_id": obs_id, "norad_id": norad, "satellite": g.get("satnogs:satellite_name"),
                "start_utc": start, "freq_hz": freq, "baud": baud, "flowgraph": flow, "n_samples": iq.n,
@@ -1295,19 +1409,13 @@ def process(ctx, obs_id):
                        (obs_id, i, a, b - a, a / rate if rate else None, (b - a) / rate if rate else None,
                         m.get("snr_db"), m.get("ebn0_db"), m.get("offset_hz"), m.get("lo_hz"), m.get("hi_hz"),
                         tx_of.get(i), m.get("carrier_hz"), m.get("carrier_db")))
-        for i, ((fr, h, ti), ok) in enumerate(zip(uniq, valid)):
+        for i, ((fr, h, ti, cm), ok) in enumerate(zip(uniq, valid)):
+            cm = (cm or {"text": fr.decode(errors="replace")}) if is_cw else None
+            toff = cm.get("t_offset_s") if cm else None
             cur = db.execute("INSERT INTO frames (obs_id, norad_id, start_utc, idx, length, data, sha1, "
-                             "transmitter, valid) VALUES (?,?,?,?,?,?,?,?,?)",
-                             (obs_id, norad, start, i, len(fr), fr, h, ti, int(ok)))
-            if is_cw:
-                db.execute("INSERT INTO telemetry VALUES (?,?,?,?)",
-                           (cur.lastrowid, "cw", json.dumps(cw_info.get(fr, {"text": fr.decode(errors="replace")})), None))
-            elif pfn:
-                try:
-                    fields, perr = json.dumps(jsonable(pfn(fr))), None
-                except Exception as e:
-                    fields, perr = None, f"{type(e).__name__}: {e}"[:300]
-                db.execute("INSERT INTO telemetry VALUES (?,?,?,?)", (cur.lastrowid, pname, fields, perr))
+                             "transmitter, valid, t_offset_s) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                             (obs_id, norad, start, i, len(fr), fr, h, ti, int(ok), toff))
+            store_decom(ctx, db, sc, cur.lastrowid, obs_id, norad, start, toff, fr, cm, ok)
 
     # --- SigMF meta
     if rate:
@@ -1328,7 +1436,7 @@ def process(ctx, obs_id):
         {"index": ti, "bursts": len(t["idx"]), "offset_hz": round(t["offset_hz"]),
          "measured_baud": round(t["baud"], 3) if t["baud"] else None,
          "frames": sum(1 for u, v in zip(uniq, valid) if v and u[2] == ti)} for ti, t in enumerate(txs)]
-    g["satnogs:processed_as"] = "cw" if is_cw else "data"
+    g["satnogs:processed_as"] = ("cw (fallback)" if cw_fallback else "cw") if is_cw else "data"
     g.update({"satnogs:status": status, "satnogs:bursts": row["n_bursts"],
               "satnogs:bursts_other": row["n_bursts_other"], "satnogs:frames": n_main,
               "satnogs:frames_other": n_other,
@@ -1352,7 +1460,7 @@ def process(ctx, obs_id):
             if m.get("carrier_hz") is not None:
                 ann["satnogs:carrier_hz"] = round(m["carrier_hz"], 1)
         if is_cw and i < len(bursts):
-            c = next((v for v in cw_info.values() if abs(v["t_offset_s"] - a / rate) < 1e-3), None)
+            c = next((v for v in cw_info if abs(v["t_offset_s"] - round(a / rate, 2)) < 1e-3), None)
             if c:
                 ann["core:comment"] = c["text"]
             if m.get("snr_db") is not None:
@@ -1651,6 +1759,52 @@ def cmd_status(ctx, _args):
     return 0
 
 
+def recalibrate(ctx, obs):
+    """Re-run parser + calibration on an observation's stored frames (no IQ needed)."""
+    row = ctx.db.execute("SELECT norad_id, start_utc, decoder FROM observations WHERE obs_id=?", (obs,)).fetchone()
+    if not row:
+        return None
+    norad, start, decoder = row
+    sc = ctx.satcfg(norad)
+    frames = ctx.db.execute("SELECT f.frame_id, f.data, f.t_offset_s, f.valid, t.fields FROM frames f "
+                            "LEFT JOIN telemetry t USING (frame_id) WHERE f.obs_id=?", (obs,)).fetchall()
+    n_pts = n_err = 0
+    with ctx.db:
+        ctx.db.execute("DELETE FROM points WHERE obs_id=?", (obs,))
+        for fid, data, toff, valid, old in frames:
+            cm = None
+            if decoder == "cw":           # keep the CW link-level fields from the decode
+                try:
+                    o = json.loads(old) if old else {}
+                except ValueError:
+                    o = {}
+                cm = {k: o[k] for k in CW_KEYS if k in o} or {"text": bytes(data).decode(errors="replace")}
+                toff = toff if toff is not None else cm.get("t_offset_s")
+            ctx.db.execute("DELETE FROM telemetry WHERE frame_id=?", (fid,))
+            n_pts += store_decom(ctx, ctx.db, sc, fid, obs, norad, start, toff, bytes(data), cm, valid)
+            n_err += ctx.db.execute("SELECT error IS NOT NULL FROM telemetry WHERE frame_id=?",
+                                    (fid,)).fetchone() == (1,)
+    return len(frames), n_pts, n_err
+
+
+def cmd_recalibrate(ctx, args):
+    ids = []
+    for n in args.ids:                   # an observation ID, or else a NORAD ID (all its passes)
+        if ctx.db.execute("SELECT 1 FROM observations WHERE obs_id=?", (n,)).fetchone():
+            ids.append(n)
+        else:
+            got = [r[0] for r in ctx.db.execute("SELECT obs_id FROM observations WHERE norad_id=? "
+                                                "ORDER BY start_utc", (n,))]
+            if not got:
+                print(f"{n}: no such observation or NORAD ID in the database")
+            ids += got
+    for obs in ids:
+        r = recalibrate(ctx, obs)
+        if r:
+            print(f"obs {obs}: {r[0]} frames re-parsed, {r[1]} points, {r[2]} parse errors")
+    return 0
+
+
 def cmd_frames(ctx, args):
     rows = ctx.db.execute(
         "SELECT f.frame_id, f.obs_id, f.transmitter, f.valid, f.length, f.data, t.parser, t.fields, t.error "
@@ -1671,8 +1825,12 @@ def cmd_frames(ctx, args):
             f = json.loads(fields)
             if isinstance(f, dict):
                 print("  " + "  ".join(f"{k}={v}" for k, v in f.items()))
-        elif err:
+        if err:
             print(f"  parse error ({parser}): {err}")
+        pts = ctx.db.execute("SELECT name, value, unit FROM points WHERE frame_id=?", (fid,)).fetchall()
+        if pts:
+            print("  EU: " + "  ".join(f"{n}={v:.4g}{(' ' + u) if u else ''}" if v is not None else f"{n}=?"
+                                      for n, v, u in pts))
         print()
     return 0
 
@@ -1694,6 +1852,8 @@ def main():
     rp.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                     help="override a worker.yml setting for this run, e.g. --set cw_search_hz=20000")
     sub.add_parser("status")
+    rc2 = sub.add_parser("recalibrate", help="re-run parser + calibration on stored frames (no IQ needed)")
+    rc2.add_argument("ids", nargs="+", type=int, help="observation IDs and/or NORAD IDs (= all their passes)")
     rp2 = sub.add_parser("retention", help="list (or --apply: delete) expired IQ files")
     rp2.add_argument("--apply", action="store_true")
     fp = sub.add_parser("frames", help="print decoded frames and telemetry")
@@ -1713,6 +1873,8 @@ def main():
         return cmd_status(ctx, args)
     if args.cmd == "frames":
         return cmd_frames(ctx, args)
+    if args.cmd == "recalibrate":
+        return cmd_recalibrate(ctx, args)
     if args.cmd == "retention":
         return cmd_retention(ctx, args)
     if args.cmd == "reprocess":

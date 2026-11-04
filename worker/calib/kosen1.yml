@@ -1,0 +1,18 @@
+# KOSEN-1 (NORAD 49402) CW beacon calibrations -> engineering units.
+# Source: KOSEN-1 website conversion table (values sent as hex, convert to DEC).
+# Field names match parsers/kosen1_cw.py. Each field: poly (coefficients in
+# ascending powers of x: c0 + c1*x + c2*x^2 + ...) or expr (Python expression in
+# x; math functions allowed), plus unit and desc.
+fields:
+  rssi:   { poly: [-127.4, 0.409],                unit: dBm,  desc: Received signal strength indicator }
+  bat_t:  { poly: [-28.1, 1.49, -0.011, 3.0e-5],  unit: degC, desc: Battery temperature }
+  bat_v:  { poly: [0, 0.0253],                    unit: V,    desc: Battery voltage }
+  # As published. On obs 15351732 this gives -1914 mA while the solar cells
+  # supply ~730 mA into a 283 mA load (battery should be charging ~+450 mA), so
+  # the formula may be wrong (e.g. * 0.0512, or a different offset/sign).
+  # Fix here, then `satnogs-worker recalibrate 49402`.
+  bat_i:  { expr: "(x - 128) / 0.0512",           unit: mA,   desc: Battery current }
+  load_i: { expr: "x / 0.1024",                   unit: mA,   desc: Load current }
+  sc_z:   { expr: "x / 0.256",                    unit: mA,   desc: Solar cell output current (-Z plane) }
+  sc_y:   { expr: "x / 0.256",                    unit: mA,   desc: Solar cell output current (-Y plane) }
+  sc_x:   { expr: "x / 0.256",                    unit: mA,   desc: Solar cell output current (-X plane) }

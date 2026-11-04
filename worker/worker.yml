@@ -1,14 +1,15 @@
 # satnogs-worker configuration — installed to <local>/worker.yml by install.sh.
-# Relative paths (SatYAML, parsers) are relative to this file's directory.
+# Full reference: docs/worker-config.md. Relative paths are relative to this file.
 #
-# decoder: auto            gr-satellites by NORAD ID
-#          <NAME>          gr-satellites built-in satellite name
-#          satyaml/X.yml   custom SatYAML file
-#          none            archive + burst annotations only
-# parser:  none
-#          satnogs:<Class> satnogs-decoders class (e.g. satnogs:Spirone)
-#          ksy/X.ksy       own Kaitai struct (needs kaitai-struct-compiler)
-#          ksy/X.py[:Cls]  pre-compiled Kaitai Python module
+# Per satellite (or under defaults:)
+#   decoder:      auto | <gr-satellites name> | satyaml/X.yml | none
+#   parser:       none | satnogs:<Class> | ksy/X.ksy | ksy/X.py[:Cls] | parsers/X.py[:func]
+#   calib:        calib/X.yml          raw fields -> engineering units (points table)
+#   mode:         cw | data            force how passes are processed (default: from flowgraph)
+#   cw_fallback:  true                 data decode found nothing -> try CW
+#   frame_prefix: "<hex>"              frames not starting with it are suspect
+#   decoder_args: [..]                 extra gr-satellites arguments
+#   sample_rate, always_decode, retention: { .. }
 
 defaults:
   decoder: auto
@@ -26,6 +27,9 @@ satellites:
   # TEVEL2-1: gr-satellites knows it only by temporary ID 98647; SatNOGS now uses 63217
   98647: { decoder: TEVEL2-1, parser: "satnogs:Ax25frames" }
   63217: { decoder: TEVEL2-1, parser: "satnogs:Ax25frames" }
+  # KOSEN-1: GMSK 9600 rarely heard, CW beacon often -> try CW when the data decode finds
+  # nothing; CW beacon parsed and calibrated to engineering units
+  49402: { cw_fallback: true, parser: parsers/kosen1_cw.py, calib: calib/kosen1.yml }
   # ALSAT-1N: not in gr-satellites; framing worked out from obs 15335933
   41789: { decoder: satyaml/ALSAT-1N.yml, parser: "satnogs:Alsat1n", frame_prefix: "414c314e00" }
 

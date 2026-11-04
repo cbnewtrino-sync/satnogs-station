@@ -3,8 +3,11 @@
 Scripts for SatNOGS station 5263: archive every observation's IQ dump as SigMF,
 then process it on the host (bursts, true sample rate, decode, telemetry).
 
-See [docs/signal-layers.md](docs/signal-layers.md) for how bursts, frames and
-payloads relate, and which tool handles each layer.
+Docs:
+- [docs/processing.md](docs/processing.md) — pipeline stages, commands (`run`, `reprocess`,
+  `recalibrate`, …), what each recomputes, outcomes, database tables
+- [docs/worker-config.md](docs/worker-config.md) — complete `worker.yml` reference
+- [docs/signal-layers.md](docs/signal-layers.md) — bursts, frames and payloads; which tool handles each layer
 
 ## Layout
 
@@ -17,6 +20,8 @@ payloads relate, and which tool handles each layer.
 | `worker/worker.yml` | host | per-satellite decoder/parser config, keyed by NORAD ID |
 | `worker/satyaml/` | host | custom SatYAML files for gr-satellites |
 | `worker/ksy/` | host | own Kaitai parsers (`.ksy`, or compiled `.py`) |
+| `worker/parsers/` | host | plain-Python parsers (`parse(bytes) -> dict`), e.g. KOSEN-1 CW |
+| `worker/calib/` | host | calibration files: raw fields → engineering units |
 | `worker/tests/` | host | synthetic-pass generator and end-to-end test |
 | `build-gr-satellites.sh` | host | build gr-satellites from source into `/usr/local` |
 
@@ -58,7 +63,8 @@ satnogs-worker reprocess 1234 1235 # redo observations (after a config change)
 satnogs-worker reprocess 1234 --mode cw                     # process as CW whatever was scheduled
 satnogs-worker reprocess 1234 --set cw_search_hz=20000       # one-off setting override
 satnogs-worker status              # queue, recent results, flowgraph check
-satnogs-worker frames 1234         # decoded frames as hex + parsed telemetry (--all: incl. suspect)
+satnogs-worker frames 1234         # decoded frames: hex, parsed fields, engineering units (--all: incl. suspect)
+satnogs-worker recalibrate 49402   # re-parse + recalibrate stored frames (obs or NORAD IDs; no IQ needed)
 satnogs-worker retention           # IQ files past their retention limit (--apply deletes them)
 journalctl -u satnogs-worker       # logs
 ```
@@ -205,7 +211,8 @@ sqlite3 <local>/station.db "select obs_id, satellite, n_bursts, n_frames, round(
 ### Testing
 
 ```
-worker/tests/run_test.sh /tmp/wt     # three synthetic 9k6 G3RUH passes
+worker/tests/run_test.sh /tmp/wt     # synthetic FSK, BPSK, CW and empty passes end to end
+/opt/satnogs-worker/venv/bin/python worker/tests/test_kosen1.py   # KOSEN-1 CW parser + calibration
 ```
 
 ## Configuration gotchas

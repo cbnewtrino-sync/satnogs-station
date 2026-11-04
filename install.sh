@@ -23,11 +23,13 @@ rm -f /tmp/satnogs-worker.$$
 install -d -m 2775 -g satnogs-client "$LOCAL/iq" "$LOCAL/queue" "$LOCAL/work" "$LOCAL/cache"
 chgrp satnogs-client "$LOCAL" "$LOCAL/iq" "$LOCAL/queue"
 chmod g+rwxs "$LOCAL" "$LOCAL/iq" "$LOCAL/queue"
-install -d -m 2775 -g satnogs-client "$LOCAL/satyaml" "$LOCAL/ksy"
+install -d -m 2775 -g satnogs-client "$LOCAL/satyaml" "$LOCAL/ksy" "$LOCAL/parsers" "$LOCAL/calib"
 install -m 664 -g satnogs-client worker/worker.yml "$LOCAL/worker.yml"
 cp worker/satyaml/*.yml "$LOCAL/satyaml/" 2>/dev/null || true
 cp worker/ksy/*.ksy worker/ksy/*.py "$LOCAL/ksy/" 2>/dev/null || true
-chgrp -R satnogs-client "$LOCAL/satyaml" "$LOCAL/ksy"
+cp worker/parsers/*.py "$LOCAL/parsers/" 2>/dev/null || true
+cp worker/calib/*.yml "$LOCAL/calib/" 2>/dev/null || true
+chgrp -R satnogs-client "$LOCAL/satyaml" "$LOCAL/ksy" "$LOCAL/parsers" "$LOCAL/calib"
 
 install -m 644 worker/systemd/satnogs-worker.service worker/systemd/satnogs-worker.timer /etc/systemd/system/
 systemctl daemon-reload

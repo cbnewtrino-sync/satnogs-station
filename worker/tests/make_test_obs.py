@@ -97,7 +97,7 @@ MORSE_TX = {"A": ".-", "B": "-...", "C": "-.-.", "D": "-..", "E": ".", "F": "..-
             "I": "..", "J": ".---", "K": "-.-", "L": ".-..", "M": "--", "N": "-.", "O": "---", "P": ".--.",
             "Q": "--.-", "R": ".-.", "S": "...", "T": "-", "U": "..-", "V": "...-", "W": ".--", "X": "-..-",
             "Y": "-.--", "Z": "--..", "0": "-----", "1": ".----", "2": "..---", "3": "...--", "4": "....-",
-            "5": ".....", "6": "-....", "7": "--...", "8": "---..", "9": "----.", "/": "-..-.", "=": "-...-"}
+            "5": ".....", "6": "-....", "7": "--...", "8": "---..", "9": "----.", "/": "-..-.", "=": "-...-", "-": "-....-"}
 
 
 def cw(text, rate, wpm, f_off=0.0, drift_hz_s=0.0, t0=0.0, rise_s=0.005):
@@ -126,6 +126,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mod", choices=["gmsk", "bpsk", "cw"], default="gmsk")
     ap.add_argument("--wpm", type=float, default=20)
+    ap.add_argument("--cw-messages", nargs="+", help="cw: message texts, cycled (default: numbered test text)")
     ap.add_argument("--drift-hz-s", type=float, default=0.0, help="carrier drift (cw)")
     ap.add_argument("--snr-bw", type=float, help="bandwidth the SNR refers to (default 2*baud; cw 500 Hz)")
     ap.add_argument("dir")
@@ -157,7 +158,8 @@ def main():
         t, k = a.start, 0
         while t < a.seconds - 2:
             if a.mod == "cw":
-                txt = f"VVV DE TEST {k:03d} T{np.random.randint(10, 99)} V{np.random.randint(100, 999)} K"
+                txt = a.cw_messages[k % len(a.cw_messages)] if a.cw_messages else \
+                    f"VVV DE TEST {k:03d} T{np.random.randint(10, 99)} V{np.random.randint(100, 999)} K"
                 s = cw(txt, a.rate, a.wpm, a.offset_hz, a.drift_hz_s, t)
                 fr = txt.encode()
             else:
