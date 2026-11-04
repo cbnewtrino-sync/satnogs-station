@@ -938,6 +938,7 @@ class Ctx:
         self.sats = {int(k): (v or {}) for k, v in (conf.get("satellites") or {}).items()}
         self.db = db_open(db_path)
         self._parsers = {}
+        self.mode_override = None
 
     def satcfg(self, norad):
         c = dict(self.defaults)
@@ -1005,7 +1006,10 @@ def process(ctx, obs_id):
     else:
         log.info("  rate %.1f S/s (%s)", rate, rate_status)
 
-    is_cw = "_cw" in flow or str(sc.get("mode", "")).lower() == "cw"
+    mode = (ctx.mode_override or str(sc.get("mode", "")) or "").lower()
+    is_cw = mode == "cw" or ("_cw" in flow and mode in ("", "auto"))
+    if ctx.mode_override:
+        log.info("  mode override: %s (scheduled flowgraph %s)", ctx.mode_override, flow)
     cw_info = {}
     if is_cw:
         # --- CW beacon: own detector/decoder (gr-satellites has no CW). Bursts =
@@ -1324,6 +1328,7 @@ def process(ctx, obs_id):
         {"index": ti, "bursts": len(t["idx"]), "offset_hz": round(t["offset_hz"]),
          "measured_baud": round(t["baud"], 3) if t["baud"] else None,
          "frames": sum(1 for u, v in zip(uniq, valid) if v and u[2] == ti)} for ti, t in enumerate(txs)]
+    g["satnogs:processed_as"] = "cw" if is_cw else "data"
     g.update({"satnogs:status": status, "satnogs:bursts": row["n_bursts"],
               "satnogs:bursts_other": row["n_bursts_other"], "satnogs:frames": n_main,
               "satnogs:frames_other": n_other,
@@ -1684,6 +1689,10 @@ def main():
     r.add_argument("--max", type=int, default=50)
     rp = sub.add_parser("reprocess")
     rp.add_argument("ids", nargs="+", type=int)
+    rp.add_argument("--mode", choices=["cw", "data"],
+                    help="process as this mode, whatever was scheduled (e.g. CW heard on a GMSK pass)")
+    rp.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                    help="override a worker.yml setting for this run, e.g. --set cw_search_hz=20000")
     sub.add_parser("status")
     rp2 = sub.add_parser("retention", help="list (or --apply: delete) expired IQ files")
     rp2.add_argument("--apply", action="store_true")
@@ -1707,6 +1716,13 @@ def main():
     if args.cmd == "retention":
         return cmd_retention(ctx, args)
     if args.cmd == "reprocess":
+        ctx.mode_override = args.mode
+        for kv in args.set:
+            k, _, v = kv.partition("=")
+            if k not in ctx.settings:
+                raise SystemExit(f"unknown setting {k!r}")
+            ctx.settings[k] = yaml.safe_load(v) if yaml else v
+            log.info("setting override: %s = %r", k, ctx.settings[k])
         args.max = len(args.ids)
         return cmd_run(ctx, args, ids=args.ids)
     if args.cmd is None:

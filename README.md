@@ -55,6 +55,8 @@ which has SPIRONE built in (identical to `worker/satyaml/SPIRONE.yml`).
 ```
 satnogs-worker run                 # process queue/ (what the timer does)
 satnogs-worker reprocess 1234 1235 # redo observations (after a config change)
+satnogs-worker reprocess 1234 --mode cw                     # process as CW whatever was scheduled
+satnogs-worker reprocess 1234 --set cw_search_hz=20000       # one-off setting override
 satnogs-worker status              # queue, recent results, flowgraph check
 satnogs-worker frames 1234         # decoded frames as hex + parsed telemetry (--all: incl. suspect)
 satnogs-worker retention           # IQ files past their retention limit (--apply deletes them)
@@ -156,7 +158,10 @@ Each transmission is a burst; its text is a frame (telemetry: text, WPM,
 carrier offset, SNR, time) and the SigMF annotation's `core:comment`. Text
 under 4 characters or more than 25 % `*` is flagged suspect. Synthetic tests:
 clean copy down to about 2 dB SNR (in 500 Hz), mostly readable at 0 to −2 dB.
-CW keyed within a pass scheduled for another mode is not decoded.
+CW keyed within a pass scheduled for another mode is not decoded automatically;
+`reprocess <id> --mode cw` decodes it (e.g. KOSEN-1: GMSK scheduled, only CW
+heard). If the CW carrier is far off-centre (a different transmitter
+frequency), widen the search: `--set cw_search_hz=20000`.
 
 ### IQ retention
 
