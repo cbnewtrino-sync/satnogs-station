@@ -1417,6 +1417,12 @@ def process(ctx, obs_id):
                              (obs_id, norad, start, i, len(fr), fr, h, ti, int(ok), toff))
             store_decom(ctx, db, sc, cur.lastrowid, obs_id, norad, start, toff, fr, cm, ok)
 
+    if sc.get("parser", "none") != "none" or sc.get("calib"):
+        n_tel, n_perr = ctx.db.execute("SELECT COUNT(*), COALESCE(SUM(t.error IS NOT NULL), 0) FROM telemetry t "
+                                       "JOIN frames f USING (frame_id) WHERE f.obs_id=?", (obs_id,)).fetchone()
+        n_pts = ctx.db.execute("SELECT COUNT(*) FROM points WHERE obs_id=?", (obs_id,)).fetchone()[0]
+        log.info("  telemetry: %d frames parsed (%d parse errors), %d points", n_tel, n_perr, n_pts)
+
     # --- SigMF meta
     if rate:
         g["core:sample_rate"] = rate
