@@ -32,6 +32,8 @@ satellites:
   49402: { cw_fallback: true, parser: parsers/kosen1_cw.py, calib: calib/kosen1.yml }
   # ALSAT-1N: not in gr-satellites; framing worked out from obs 15335933
   41789: { decoder: satyaml/ALSAT-1N.yml, parser: "satnogs:Alsat1n", frame_prefix: "414c314e00" }
+  # OrigamiSat-2: looking for AFSK 1200, but usually only see CW, no parser yet
+  68795: { decoder: satyaml/ORIGAMISAT-2.yml, cw_fallback: true }
 
 settings:
   gr_satellites: gr_satellites
@@ -48,4 +50,4 @@ settings:
   # already uploaded everything to SatNOGS); keep = leave unprocessed (other_days
   # retention); process = treat like our own. [] turns the filter off.
   own_observers: [NewtMan]
-  others: delete
+  others: keep
