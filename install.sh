@@ -7,6 +7,7 @@ cd "$(dirname "$0")"
 LOCAL=/var/lib/docker-bindmounts/satnogs_satnogs-client/opt/satnogs-non-free/local
 DEST=$LOCAL/scripts
 VENV=/opt/satnogs-worker/venv
+SYSDIR=/etc/systemd/system/
 
 install -m 755 -g satnogs-client satnogs-post *.py "$DEST"/
 echo "installed container scripts to $DEST"
@@ -31,7 +32,10 @@ cp worker/parsers/*.py "$LOCAL/parsers/" 2>/dev/null || true
 cp worker/calib/*.yml "$LOCAL/calib/" 2>/dev/null || true
 chgrp -R satnogs-client "$LOCAL/satyaml" "$LOCAL/ksy" "$LOCAL/parsers" "$LOCAL/calib"
 
-install -m 644 worker/systemd/satnogs-worker.service worker/systemd/satnogs-worker.timer /etc/systemd/system/
+install -m 644 worker/systemd/satnogs-worker.service worker/systemd/satnogs-worker.timer $SYSDIR
+install -m 644 satnogs-auto-scheduler.service satnogs-auto-scheduler.timer $SYSDIR
 systemctl daemon-reload
-systemctl enable --now satnogs-worker.timer
+systemctl enable --now satnogs-worker.timer satnogs-auto-scheduler.timer
 echo "installed satnogs-worker; timer enabled (journalctl -u satnogs-worker)"
+echo "installed satnogs-auto-scheduler; timer enabled (journalctl -u satnogs-auto-scheduler)"
+

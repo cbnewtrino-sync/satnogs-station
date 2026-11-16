@@ -1,0 +1,9 @@
+[Unit]
+Description=Run satnogs-auto-scheduler every 12 hours and on boot
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=12h
+
+[Install]
+WantedBy=timers.target

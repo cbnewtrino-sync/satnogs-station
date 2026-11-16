@@ -1,0 +1,7 @@
+[Unit]
+Description=Schedule SatNOGS observations for 12h on station 5263
+
+[Service]
+Type=oneshot
+ExecStart=/home/pi/satnogs-auto-scheduler/auto_scheduler/.venv/bin/schedule_single_station -s 5263 -d 12 -m 50 -r 25 -S 45 -P /tmp/cache/priorities_5263.txt -f
+User=pi
