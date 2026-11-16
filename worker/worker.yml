@@ -44,10 +44,10 @@ settings:
   clock_min_db: 8.0          # symbol-clock line needed to measure a satellite's baud
   baud_search_frac: 0.02     # +-2 % around nominal baud
   baud_flag_ppm: 1000        # warn above this baud offset
-  retention_auto: false      # true: each `run` deletes expired IQ. Check `satnogs-worker retention` first
+  retention_auto: true      # true: each `run` deletes expired IQ. Check `satnogs-worker retention` first
   # Passes scheduled by other SatNOGS users (once the station is "available"): looked up
   # in the Network API before processing. delete = remove IQ + metadata (the client has
   # already uploaded everything to SatNOGS); keep = leave unprocessed (other_days
   # retention); process = treat like our own. [] turns the filter off.
   own_observers: [NewtMan]
-  others: keep
+  others: process
